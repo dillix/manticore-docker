@@ -1,0 +1,40 @@
+#!/bin/sh
+# =============================================================================
+# config — host-side wrapper for the `config` Compose service
+# =============================================================================
+# Usage:
+#   ./config <subcommand> [args...]
+#
+# Examples:
+#   ./config show
+#   ./config domain search.example.com
+#   ./config email admin@example.com
+#   ./config username drupal
+#   ./config password generate
+#   ./config password change 'my-strong-password'
+#   ./config setup
+#   ./config help
+#
+# This wrapper exists so you don't have to repeat the verbose
+# `HOST_UID=$(id -u) HOST_GID=$(id -g) docker compose run --rm -it config ...`
+# incantation. Everything is forwarded to the bin/config.sh script running
+# inside the `config` Compose service.
+#
+# If `./config` fails to run with "permission denied", restore the bit:
+#   chmod +x ./config
+# (it should already be executable on a fresh git clone).
+# =============================================================================
+
+set -eu
+
+# Resolve the directory containing this script so the wrapper can be
+# invoked from any working directory (e.g. `~/projects/manticore-docker/config`
+# from elsewhere). All subsequent commands run with that directory as cwd
+# so docker compose finds docker-compose.yml.
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+exec docker compose run --rm -it \
+    -e HOST_UID="$(id -u)" \
+    -e HOST_GID="$(id -g)" \
+    config "$@"

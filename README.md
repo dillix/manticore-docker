@@ -25,6 +25,7 @@ Drupal module, but it is generic — any HTTP client can talk to it.
 - [Verify the installation](#verify-the-installation)
 - [Connecting from Drupal](#connecting-from-drupal)
 - [Operations](#operations)
+- [Configuration helper reference](#configuration-helper-reference)
 - [Troubleshooting](#troubleshooting)
 - [License](#license)
 
@@ -155,12 +156,6 @@ The `hello-world` container should print a confirmation message starting with
 `Hello from Docker!`. If you see it, Docker is fully functional and ready to
 run Manticore.
 
-> **A note on running Docker as a non-root user.** The commands above use
-> `sudo`. To allow your regular user account to run `docker` without `sudo`,
-> add it to the `docker` group: `sudo usermod -aG docker $USER`, then log out
-> and back in. Be aware that membership in the `docker` group is effectively
-> equivalent to having root access on the host — only add trusted users.
-
 **8. Allow your regular user to run Docker without `sudo` (recommended).**
 
 Running the rest of this guide as `root` is possible but discouraged. To
@@ -199,10 +194,11 @@ they are run as a regular user from the `docker` group, without `sudo`.
 
 ## Deploy the stack
 
-The stack consists of a single `docker-compose.yml` describing two services
-(`manticore` and `caddy`) and a couple of supporting files. Clone this
-repository and start the stack with one command — no further configuration
-is needed for Scenario A.
+The stack consists of a single `docker-compose.yml` describing three
+services (`manticore`, `caddy`, and an on-demand `config` helper) plus a
+few supporting files. Clone this repository and start the stack with one
+command — minimal configuration for Scenario A, just four values for
+Scenario B (all managed through the `./config` helper).
 
 **1. Clone the repository.**
 
@@ -227,7 +223,7 @@ contribute. The `chown` step transfers ownership to the current user so that
 all subsequent `docker compose` commands can be run without `sudo` (assuming
 your user is in the `docker` group, see installation step 8 above).
 
-**2. Start Manticore (Scenario A — no Caddy).**
+### Scenario A — single VPS, no public endpoint
 
 ```bash
 docker compose up -d
@@ -243,14 +239,12 @@ image from Docker Hub (~200 MB) and creates the container in detached
  ✔ Container manticore                 Started
 ```
 
-**3. Verify that the container is running.**
+Within ~30 seconds (the healthcheck `start_period`) the status changes from
+`(health: starting)` to `(healthy)`:
 
 ```bash
 docker compose ps
 ```
-
-Within ~30 seconds (the healthcheck `start_period`) the status changes from
-`(health: starting)` to `(healthy)`:
 
 ```
 NAME        IMAGE                              STATUS                  PORTS
@@ -261,39 +255,152 @@ Note that ports `9306` and `9308` are bound to `127.0.0.1` only — they are
 not reachable from the public network. Port `9312` is the internal Sphinx
 protocol port, not exposed to the host at all.
 
-**4. Inspect the daemon log.**
+You can now point your local Drupal site at `http://127.0.0.1:9308`.
+
+### Scenario B — public HTTPS endpoint with Caddy
+
+Scenario B adds a Caddy reverse proxy in front of Manticore. Caddy obtains
+a Let's Encrypt TLS certificate automatically and enforces HTTP Basic
+Authentication on every request.
+
+All configuration is managed through the `./config` helper, a thin wrapper
+around `docker compose run --rm -it config` (see [Configuration helper
+reference](#configuration-helper-reference) below for the full command
+list).
+
+**1. Configure the four required `.env` values.**
+
+You can configure each value individually:
 
 ```bash
-docker compose logs manticore --tail=20
+./config domain   search.example.com
+./config email    admin@example.com
+./config username drupal
+./config password generate
 ```
 
-You should see the daemon initialising and the line `accepting connections`:
+Each command shows a preview of the planned change and asks for
+confirmation. The `.env` file is created automatically from `.env.example`
+the first time you run any of them.
+
+Replace `search.example.com`, `admin@example.com`, and `drupal` with your
+own values. The domain must have a public DNS `A` record pointing at this
+VPS before you continue — Let's Encrypt will validate ownership by sending
+an HTTP request to `http://<your-domain>/.well-known/acme-challenge/...`
+within seconds of starting Caddy.
+
+When you run `./config password generate`, you will see output like this:
 
 ```
-manticore  | starting daemon version '25.0.0 ...' ...
-manticore  | listening on all interfaces for mysql, port=9306
-manticore  | listening on all interfaces for sphinx and http(s), port=9308
-manticore  | listening on 172.18.0.2:9312 for sphinx and http(s)
-manticore  | prereading 0 tables
-manticore  | preread 0 tables in 0.000 sec
-manticore  | accepting connections
-manticore  | [BUDDY] started v3.44.1+... at http://127.0.0.1:...
-manticore  | [BUDDY] Loaded plugins:
-manticore  | [BUDDY]   core: empty-string, backup, emulate-elastic, fuzzy, create-table, ...
+============================================================
+  PASSWORD (save this NOW — it will not be shown again):
+
+      5J.vuTaj9vKvIibUSMMFVn7x
+
+============================================================
+
+
+  + MANTICORE_PASSWORD_HASH=$$2a$$14$$q2ZtT2gmqTmRgPCB1jG8f.eveOC/yFa1eSJY2rpJ94fLk8otYiP52
+
+Apply this change? [y/N] y
+Updated MANTICORE_PASSWORD_HASH.
 ```
 
-The `[BUDDY]` lines indicate that
-[Manticore Buddy](https://github.com/manticoresoftware/manticoresearch-buddy)
-— the embedded PHP plugin system that extends Manticore's SQL parser — has
-loaded successfully. This is normal and required for many SQL features.
+**Copy the plaintext password to a password manager before answering `y`.**
+It will not be shown again, and you will need it later when configuring the
+Search API server in Drupal.
+
+If you prefer to use a password of your own choosing instead of a random
+one, use `password change` instead:
+
+```bash
+./config password change 'your-strong-password'
+```
+
+Wrap the password in **single quotes** — characters like `$`, `!`, `&`
+may be interpreted by your host shell otherwise.
+
+> **Why are there `$$` in the hash?** Compose interpolates values loaded
+> from `.env` when substituting them into `docker-compose.yml`. A bcrypt
+> hash like `$2a$14$XXXX` would be mis-parsed: Compose would try to expand
+> `$2a`, `$14`, and `$XXXX` as variable references. Doubling each `$`
+> escapes the interpolation; Compose strips one `$` from each pair when
+> passing the value to Caddy, which then sees the correct single-`$` hash.
+> The `./config password` commands handle this for you; never edit
+> `MANTICORE_PASSWORD_HASH` by hand.
+
+**2. Verify `.env` is complete.**
+
+```bash
+./config show
+```
+
+You should see all four values populated, with the password hash masked
+for safety:
+
+```
+Current configuration (.env)
+
+  MANTICORE_DOMAIN       = search.example.com
+  MANTICORE_ACME_EMAIL   = admin@example.com
+  MANTICORE_USERNAME     = drupal
+  MANTICORE_PASSWORD_HASH= $$2a$$14$$••••••••
+```
+
+**3. Start the stack with the `public` profile.**
+
+```bash
+docker compose --profile public up -d
+```
+
+Expected output:
+
+```
+[+] up 3/3
+ ✔ Network manticore-docker_manticore Created
+ ✔ Container manticore                Healthy
+ ✔ Container manticore-caddy          Started
+```
+
+Caddy starts after Manticore reaches the `healthy` state, thanks to a
+`depends_on` directive — typically about 5-7 seconds.
+
+**4. Watch the Caddy logs while it obtains the certificate.**
+
+```bash
+docker compose logs -f caddy
+```
+
+The certificate acquisition takes 10-30 seconds. Look for these lines in
+order:
+
+```
+caddy  | "msg":"using ACME account","account_contact":["mailto:admin@example.com"]
+caddy  | "msg":"trying to solve challenge","identifier":"search.example.com","challenge_type":"http-01"
+caddy  | "msg":"served key authentication","identifier":"search.example.com","challenge":"http-01","remote":"23.178.112.104:XXXXX"
+caddy  | "msg":"served key authentication","identifier":"search.example.com","challenge":"http-01","remote":"13.62.227.138:XXXXX"
+... (several more from different Let's Encrypt validation servers)
+caddy  | "msg":"authorization finalized","identifier":"search.example.com","authz_status":"valid"
+caddy  | "msg":"successfully downloaded available certificate chains"
+caddy  | "msg":"certificate obtained successfully","identifier":"search.example.com"
+```
+
+The `served key authentication` lines come from Let's Encrypt's validation
+nodes pinging your VPS from multiple regions. Five or more of them is
+normal. The final `certificate obtained successfully` is the signal that
+the endpoint is ready.
+
+Press `Ctrl+C` to stop following the log; the container continues running.
 
 
 ## Verify the installation
 
-Manticore exposes a simple JSON over HTTP API on port 9308. The following
-end-to-end smoke test creates a small table, inserts three documents,
-performs full-text searches against them, and tears the table down. Run it
-on the same VPS to confirm the stack is fully functional.
+Manticore exposes a simple JSON over HTTP API on port 9308. The smoke tests
+below confirm the stack is fully functional in your chosen scenario.
+
+### Scenario A — local access
+
+Run these on the same VPS as Manticore:
 
 **1. Server status and version.**
 
@@ -401,6 +508,78 @@ mapping in `docker-compose.yml`) and your Manticore is open to the world
 without authentication — **stop the stack immediately and fix it before
 exposing the host further**.
 
+### Scenario B — public HTTPS access
+
+Run these from any host (the same VPS or a remote machine). Replace
+`search.example.com` and the password with your own values.
+
+**1. Without authentication — expect `401 Unauthorized`.**
+
+```bash
+curl -sI https://search.example.com/cli
+```
+
+```
+HTTP/2 401
+www-authenticate: Basic realm="restricted"
+server: Caddy
+alt-svc: h3=":443"; ma=2592000
+```
+
+`HTTP/2` (rather than `HTTP/1.1`) means TLS is correctly negotiated;
+`Caddy` in the `server` header confirms the reverse proxy is handling the
+request; `www-authenticate: Basic` shows the auth challenge is active.
+
+**2. With correct credentials — expect a Manticore status table.**
+
+```bash
+curl -s -u 'drupal:your-password' https://search.example.com/cli -d 'SHOW STATUS' | head -10
+```
+
+```
++-------------------------------+------------------------------------------------------------+
+| Counter                       | Value                                                      |
++-------------------------------+------------------------------------------------------------+
+| uptime                        | 86                                                         |
+| connections                   | 9                                                          |
+| version                       | 25.0.0 ce3c27828@26032712 (columnar 13.0.0 ...)            |
+...
+```
+
+**3. HTTP → HTTPS redirect.**
+
+```bash
+curl -sI http://search.example.com/cli
+```
+
+```
+HTTP/1.1 308 Permanent Redirect
+Location: https://search.example.com/cli
+Server: Caddy
+```
+
+If all three commands behave as shown, the endpoint is production-ready
+and you can configure Drupal to connect to it.
+
+**4. (Optional) Verify the certificate chain.**
+
+```bash
+echo | openssl s_client -connect search.example.com:443 -servername search.example.com 2>/dev/null \
+  | openssl x509 -noout -issuer -subject -dates
+```
+
+You should see Let's Encrypt as the issuer and your domain as the subject:
+
+```
+issuer=C=US, O=Let's Encrypt, CN=R10
+subject=CN=search.example.com
+notBefore=May 16 14:00:00 2026 GMT
+notAfter=Aug 14 14:00:00 2026 GMT
+```
+
+Caddy will renew this certificate automatically when ~30 days remain
+before expiry.
+
 
 ## Connecting from Drupal
 
@@ -480,6 +659,17 @@ docker exec -it manticore mysql
 From the prompt you can run any Manticore SQL: `SHOW TABLES`, `SELECT *
 FROM <table>`, `OPTIMIZE`, `FLUSH RAMCHUNK`, etc.
 
+**Manage configuration** (`.env` values):
+
+```bash
+./config show                         # see current settings
+./config password generate            # rotate the Basic Auth password
+./config domain   search.new.com      # change domain (will need to re-issue cert)
+```
+
+See [Configuration helper reference](#configuration-helper-reference)
+for the full list of subcommands.
+
 **Upgrade Manticore** to a new minor or patch version:
 
 1. Update the `image:` line in `docker-compose.yml` (e.g. `25.0.1` →
@@ -507,6 +697,92 @@ durability. For details and restore procedure, see
 [Manticore's backup docs](https://manual.manticoresearch.com/Securing_and_compacting_a_table/Backup_and_restore).
 
 
+## Configuration helper reference
+
+The `./config` wrapper provides a single entrypoint for managing the
+`.env` file. Every subcommand validates input, shows a diff of the
+planned change, asks for confirmation, and restores host file ownership
+afterwards. The actual logic lives in `bin/config.sh`; the wrapper just
+forwards arguments to `docker compose run --rm -it config <args>` with
+the right Compose flags.
+
+**Inspect current configuration:**
+
+```bash
+./config show
+```
+
+Displays all four `.env` values; the password hash is masked.
+
+**Set domain, email, or username:**
+
+```bash
+./config domain   search.example.com
+./config email    admin@example.com
+./config username drupal
+```
+
+Each command validates its argument:
+
+- **Domain:** must be a valid hostname (lowercase letters, digits,
+  hyphens, dots) — no protocol prefix, no slashes, no spaces.
+- **Email:** standard local-part `@` domain `.` TLD form.
+- **Username:** 1–32 characters, ASCII letters/digits/underscore/hyphen
+  only.
+
+Invalid input is rejected without changing `.env`. If the new value is
+identical to the current one, the command reports `No change` and exits.
+
+**Manage the Basic Auth password:**
+
+```bash
+./config password generate            # random 24-char password + hash
+./config password change 'my-pwd'     # hash a specific password
+```
+
+The `generate` form prints the plaintext password once in a clearly
+framed block — **save it immediately**; it is not stored anywhere on
+disk in cleartext. Both commands write the bcrypt hash to
+`MANTICORE_PASSWORD_HASH` in `.env` with the required `$$` escaping for
+Compose interpolation.
+
+Always wrap the password in **single quotes** when using `change` —
+characters like `$`, `!`, `&` are interpreted by the host shell
+otherwise.
+
+**Interactive setup wizard:**
+
+```bash
+./config setup
+```
+
+Walks you through all four values in a single guided flow — useful for
+first-time deployment. _(Coming soon — currently shows a stub message.)_
+
+**Help:**
+
+```bash
+./config help
+```
+
+**Wrapper not executable on a fresh clone?**
+
+The `./config` wrapper has its executable bit recorded in git (mode
+`100755`), so `git clone` on Linux and macOS leaves it executable. On
+Windows under WSL, or after some `git apply`/`git format-patch` round
+trips, the bit may be lost. Restore it:
+
+```bash
+chmod +x ./config
+```
+
+If you intend to commit and push this fix back, also tell git:
+
+```bash
+git update-index --chmod=+x ./config
+```
+
+
 ## Troubleshooting
 
 **`permission denied while trying to connect to the Docker API at
@@ -529,21 +805,64 @@ a network error, the container has not been recreated since the
 docker compose up -d --force-recreate manticore
 ```
 
-**`The "MANTICORE_DOMAIN" variable is not set` warnings** when running
-`docker compose` for Scenario A — make sure your `docker-compose.yml` uses
-the default-expansion syntax `${MANTICORE_DOMAIN:-}` (with the trailing
-`:-`), not just `${MANTICORE_DOMAIN}`. The colon-dash tells Compose to fall
-back to an empty string rather than warn.
+**`WARN[0000] The "xyz" variable is not set. Defaulting to a blank string`**
+when running any `docker compose` command — Compose is trying to interpolate
+a `$xyz...` substring it found inside one of your `.env` values. This
+almost always means `MANTICORE_PASSWORD_HASH` was written without the
+required `$$` escaping. Regenerate it using the bundled helper:
 
-**Port 80 or 443 already in use** (Scenario B) — another web server on the
-host is bound to those ports. If you have a system Nginx or Apache running,
-either stop it (`sudo systemctl stop nginx`) or — better — choose a host
-that does not also serve other websites for the Manticore endpoint.
+```bash
+docker compose --profile public down
+./config password generate
+docker compose --profile public up -d
+```
 
-**Caddy fails to obtain a Let's Encrypt certificate** — verify that
-your domain's A record points to this VPS, and that port 80 is reachable
-from the public internet (Let's Encrypt validates over HTTP first). Check
-Caddy logs: `docker compose logs caddy --tail=50`.
+After the fix, `MANTICORE_PASSWORD_HASH` in `.env` should start with
+`$$2a$$` or `$$2b$$` (doubled dollars), and there should be no WARN
+messages on subsequent commands.
+
+**`./config` prompts don't respond to `y` at the confirmation prompt** —
+the wrapper already passes `-it` to `docker compose run`. If you're
+invoking the underlying compose service directly (without the wrapper),
+make sure to pass both flags:
+
+```bash
+docker compose run --rm -it config password generate
+```
+
+Without `-it`, Compose may not allocate a TTY, and `read` silently treats
+the prompt as cancelled.
+
+**`docker compose config --services` does not list `caddy` or `config`**
+— these services have `profiles:` and are hidden from `config --services`
+unless the matching profiles are explicitly active:
+
+```bash
+docker compose --profile public --profile tools config --services
+```
+
+This is documented Compose behaviour, not a bug. Helper commands like
+`docker compose run --rm <service>` activate the matching profile
+automatically.
+
+**Caddy fails to obtain a Let's Encrypt certificate** — typical causes:
+
+- Your domain's `A` record does not point at this VPS, or DNS has not yet
+  propagated. Verify with `dig +short search.example.com @1.1.1.1`.
+- Port 80 is blocked by the host firewall or a cloud provider's network
+  ACL. ACME's `http-01` challenge requires inbound 80; Caddy listens on
+  it for that purpose. Check `sudo ufw status` and any provider firewall.
+- Another service is already listening on port 80 (system Nginx or
+  Apache). Stop it (`sudo systemctl stop nginx`) or use a host that does
+  not also serve websites for the Manticore endpoint.
+- Let's Encrypt rate limit reached after multiple failed attempts. Wait
+  one hour, fix the underlying problem (DNS, firewall), and retry.
+
+Check Caddy's diagnostic output:
+
+```bash
+docker compose logs caddy --tail=100
+```
 
 **`failed to allocate memlock`** in Manticore logs — your kernel does not
 allow unlimited memory locking. The stack requests `memlock=-1:-1` via
@@ -555,6 +874,18 @@ slightly less efficiently for very large indexes.
 It survives `docker compose down` and `docker compose up`. To start from
 scratch, `docker compose down` then `rm -rf ./data` — but this destroys all
 indexed content.
+
+**I forgot the Basic Auth password.** The bcrypt hash in `.env` is
+one-way; the plaintext cannot be recovered. Generate a new one:
+
+```bash
+docker compose --profile public down
+./config password generate
+docker compose --profile public up -d
+```
+
+Don't forget to update the Drupal Search API server configuration with the
+new password afterwards.
 
 
 ## License

@@ -57,17 +57,26 @@ services:
     networks:
       - manticore
 
-  # Helper: generate a random password, hash it, and write the hash to .env.
+  # Configuration helper: a single entrypoint with subcommands for
+  # managing .env (domain, email, username, password) and running the
+  # interactive setup wizard. The shell logic lives in bin/config.sh,
+  # which is mounted read-only and executed via `sh /work/bin/config.sh`
+  # — no executable bit (+x) on the host is required.
+  #
   # Runs on demand only (profile=tools) — never started by `up -d`.
   #
   # Usage:
-  #   docker compose run --rm generate-password
+  #   docker compose run --rm -it config <subcommand> [args...]
   #
-  # The password is printed once to stdout in a clearly framed block;
-  # you MUST save it immediately (this is the plaintext you will paste
-  # into the Drupal Search API server form). The bcrypt hash is written
-  # to MANTICORE_PASSWORD_HASH in .env after confirmation.
-  generate-password:
+  # Examples:
+  #   docker compose run --rm -it config show
+  #   docker compose run --rm -it config domain search.example.com
+  #   docker compose run --rm -it config email admin@example.com
+  #   docker compose run --rm -it config username drupal
+  #   docker compose run --rm -it config password generate
+  #   docker compose run --rm -it config password change 'my-password'
+  #   docker compose run --rm -it config setup        (coming soon)
+  config:
     image: caddy:2-alpine
     profiles: ["tools"]
     environment:
@@ -76,189 +85,7 @@ services:
     volumes:
       - .:/work
     working_dir: /work
-    entrypoint:
-      - /bin/sh
-      - -c
-      - |
-        set -eu
-
-        # 1. Generate a 24-character password from a safe alphabet:
-        #    [A-Za-z0-9!_.-] — copy/paste-friendly, no shell-quoting traps.
-        #    /dev/urandom is the kernel CSPRNG and is suitable for secrets.
-        PASSWORD=$$(tr -dc 'A-Za-z0-9!_.-' </dev/urandom | head -c 24)
-
-        # 2. Hash it with bcrypt.
-        RAW_HASH=$$(caddy hash-password --plaintext "$$PASSWORD")
-
-        # 3. Double every '$' for Compose interpolation. When Compose
-        #    loads .env to inject variables into docker-compose.yml,
-        #    it processes the values themselves — every literal '$' must
-        #    be escaped as '$$' or Compose will try to expand '$xyz...'
-        #    as another variable and corrupt the hash.
-        ESCAPED_HASH=$$(echo "$$RAW_HASH" | sed 's/[$$]/$$$$/g')
-        NEW_LINE="MANTICORE_PASSWORD_HASH=$$ESCAPED_HASH"
-
-        # 4. Show the plaintext password.
-        echo ""
-        echo "============================================================"
-        echo "  PASSWORD (save this NOW — it will not be shown again):"
-        echo ""
-        echo "      $$PASSWORD"
-        echo ""
-        echo "============================================================"
-        echo ""
-
-        # 5. Ensure .env exists.
-        if [ ! -f .env ]; then
-          if [ -f .env.example ]; then
-            cp .env.example .env
-            echo ".env was missing — created from .env.example."
-          else
-            : > .env
-            echo ".env was missing — created empty."
-          fi
-        fi
-
-        # 6. Show the planned change.
-        if grep -q '^MANTICORE_PASSWORD_HASH=' .env; then
-          OLD_LINE=$$(grep '^MANTICORE_PASSWORD_HASH=' .env || true)
-          echo "Existing line in .env will be REPLACED:"
-          echo "  - $$OLD_LINE"
-          echo "  + $$NEW_LINE"
-        else
-          echo "Will append to .env:"
-          echo "  + $$NEW_LINE"
-        fi
-        echo ""
-
-        # 7. Confirm.
-        printf "Apply this change? [y/N] "
-        read CONFIRM
-        case "$$CONFIRM" in
-          y|Y|yes|YES) ;;
-          *) echo "Aborted. .env was not modified."; exit 0 ;;
-        esac
-
-        # 8. Apply.
-        if grep -q '^MANTICORE_PASSWORD_HASH=' .env; then
-          sed -i "s|^MANTICORE_PASSWORD_HASH=.*|$$NEW_LINE|" .env
-        else
-          printf '%s\n' "$$NEW_LINE" >> .env
-        fi
-        chown "$$HOST_UID:$$HOST_GID" .env
-
-        echo ".env updated."
-
-        # 9. Sanity-check that MANTICORE_USERNAME is set; warn if not.
-        if ! grep -qE '^MANTICORE_USERNAME=.+' .env; then
-          echo ""
-          echo "WARNING: MANTICORE_USERNAME is not set in .env."
-          echo "Set it before starting Caddy, for example:"
-          echo "  sed -i 's|^MANTICORE_USERNAME=.*|MANTICORE_USERNAME=drupal|' .env"
-        fi
-      - "generate-password"
-
-  # Helper: hash a user-supplied password and write it to .env.
-  # Runs on demand only (profile=tools) — never started by `up -d`.
-  #
-  # Usage:
-  #   docker compose run --rm change-password 'your-password'
-  #
-  # IMPORTANT: always wrap the password in single quotes on the host
-  # shell. Otherwise characters like $, !, & may be interpreted before
-  # they reach the container.
-  change-password:
-    image: caddy:2-alpine
-    profiles: ["tools"]
-    environment:
-      HOST_UID: ${HOST_UID:-1000}
-      HOST_GID: ${HOST_GID:-1000}
-    volumes:
-      - .:/work
-    working_dir: /work
-    # The shell script is in `entrypoint`, not `command`, because
-    # `docker compose run --rm change-password 'pwd'` REPLACES `command`
-    # entirely with the user's arguments. Putting the script in
-    # `entrypoint` keeps it intact and lets the user-supplied password
-    # land in $$1 (the placeholder "change-password" below becomes $$0).
-    entrypoint:
-      - /bin/sh
-      - -c
-      - |
-        set -eu
-
-        PASSWORD="$${1:-}"
-        if [ -z "$$PASSWORD" ]; then
-          echo "Error: no password supplied." >&2
-          echo "" >&2
-          echo "Usage:" >&2
-          echo "  docker compose run --rm change-password 'your-password'" >&2
-          echo "" >&2
-          echo "Wrap the password in single quotes to avoid shell expansion." >&2
-          exit 1
-        fi
-
-        # 1. Hash with bcrypt.
-        RAW_HASH=$$(caddy hash-password --plaintext "$$PASSWORD")
-
-        # 2. Double every '$' for Compose interpolation. When Compose
-        #    loads .env to inject variables into docker-compose.yml,
-        #    it processes the values themselves — every literal '$' must
-        #    be escaped as '$$' or Compose will try to expand '$xyz...'
-        #    as another variable and corrupt the hash.
-        ESCAPED_HASH=$$(echo "$$RAW_HASH" | sed 's/[$$]/$$$$/g')
-        NEW_LINE="MANTICORE_PASSWORD_HASH=$$ESCAPED_HASH"
-
-        # 3. Ensure .env exists.
-        if [ ! -f .env ]; then
-          if [ -f .env.example ]; then
-            cp .env.example .env
-            echo ".env was missing — created from .env.example."
-          else
-            : > .env
-            echo ".env was missing — created empty."
-          fi
-        fi
-
-        # 4. Show the planned change.
-        echo ""
-        if grep -q '^MANTICORE_PASSWORD_HASH=' .env; then
-          OLD_LINE=$$(grep '^MANTICORE_PASSWORD_HASH=' .env || true)
-          echo "Existing line in .env will be REPLACED:"
-          echo "  - $$OLD_LINE"
-          echo "  + $$NEW_LINE"
-        else
-          echo "Will append to .env:"
-          echo "  + $$NEW_LINE"
-        fi
-        echo ""
-
-        # 5. Confirm.
-        printf "Apply this change? [y/N] "
-        read CONFIRM
-        case "$$CONFIRM" in
-          y|Y|yes|YES) ;;
-          *) echo "Aborted. .env was not modified."; exit 0 ;;
-        esac
-
-        # 6. Apply.
-        if grep -q '^MANTICORE_PASSWORD_HASH=' .env; then
-          sed -i "s|^MANTICORE_PASSWORD_HASH=.*|$$NEW_LINE|" .env
-        else
-          printf '%s\n' "$$NEW_LINE" >> .env
-        fi
-        chown "$$HOST_UID:$$HOST_GID" .env
-
-        echo ".env updated."
-
-        # 7. Sanity-check.
-        if ! grep -qE '^MANTICORE_USERNAME=.+' .env; then
-          echo ""
-          echo "WARNING: MANTICORE_USERNAME is not set in .env."
-          echo "Set it before starting Caddy, for example:"
-          echo "  sed -i 's|^MANTICORE_USERNAME=.*|MANTICORE_USERNAME=drupal|' .env"
-        fi
-      - "change-password"
+    entrypoint: ["/bin/sh", "/work/bin/config.sh"]
 
   caddy:
     image: caddy:2-alpine
