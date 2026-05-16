@@ -44,7 +44,11 @@ services:
       - IPC_LOCK
 
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:9308/cli -d 'SHOW STATUS' || exit 1"]
+      # Probe the HTTP API on port 9308 (the same one Drupal will use).
+      # The manticoresearch/manticore image ships with wget but NOT curl.
+      # We hit the /cli endpoint with SHOW STATUS and discard the body;
+      # wget returns a non-zero exit code on connection failure or 4xx/5xx.
+      test: ["CMD-SHELL", "wget -q --post-data='SHOW STATUS' -O /dev/null http://127.0.0.1:9308/cli || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
