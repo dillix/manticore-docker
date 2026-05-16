@@ -1,5 +1,5 @@
 # Manticore Search Docker Stack
-# https://github.com/<your-org>/<repo>
+# https://github.com/dillix/manticore-docker
 #
 # Usage:
 #   Scenario A (single VPS, local only):
@@ -64,10 +64,10 @@ services:
       - "443:443"
 
     environment:
-      MANTICORE_DOMAIN: ${MANTICORE_DOMAIN}
-      MANTICORE_ACME_EMAIL: ${MANTICORE_ACME_EMAIL}
-      MANTICORE_USERNAME: ${MANTICORE_USERNAME}
-      MANTICORE_PASSWORD_HASH: ${MANTICORE_PASSWORD_HASH}
+      MANTICORE_DOMAIN: ${MANTICORE_DOMAIN:-}
+      MANTICORE_ACME_EMAIL: ${MANTICORE_ACME_EMAIL:-}
+      MANTICORE_USERNAME: ${MANTICORE_USERNAME:-}
+      MANTICORE_PASSWORD_HASH: ${MANTICORE_PASSWORD_HASH:-}
 
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
