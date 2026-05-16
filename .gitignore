@@ -1,0 +1,13 @@
+# Local environment configuration — contains secrets, never commit
+.env
+
+# Manticore persistent data volume
+data/
+
+# OS / editor artifacts
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

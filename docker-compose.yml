@@ -1,0 +1,90 @@
+# Manticore Search Docker Stack
+# https://github.com/<your-org>/<repo>
+#
+# Usage:
+#   Scenario A (single VPS, local only):
+#     docker compose up -d
+#
+#   Scenario B (two VPS, public HTTPS endpoint with Caddy):
+#     docker compose --profile public up -d
+#
+# Configuration is in the .env file; copy .env.example to .env first.
+
+services:
+
+  manticore:
+    image: manticoresearch/manticore:25.0.0
+    container_name: manticore
+    restart: unless-stopped
+
+    # Bind ports to 127.0.0.1 only — Manticore has no built-in
+    # authentication, so it must never be exposed directly.
+    # In Scenario B, Caddy (in the same Docker network) reaches it
+    # via the internal hostname `manticore`, no host port needed.
+    # In Scenario A, the local Drupal site reaches it via 127.0.0.1.
+    ports:
+      - "127.0.0.1:9306:9306"   # MySQL protocol (admin/debug)
+      - "127.0.0.1:9308:9308"   # HTTP/JSON API (used by Drupal)
+
+    volumes:
+      - ./data:/var/lib/manticore
+
+    # Manticore performance-tuning recommendations from the official
+    # Docker Hub image documentation:
+    # https://hub.docker.com/r/manticoresearch/manticore
+    ulimits:
+      nproc: 65535
+      nofile:
+        soft: 65535
+        hard: 65535
+      memlock:
+        soft: -1
+        hard: -1
+    cap_add:
+      - IPC_LOCK
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9308/cli -d 'SHOW STATUS' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+    networks:
+      - manticore
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: manticore-caddy
+    restart: unless-stopped
+    profiles: ["public"]
+
+    ports:
+      - "80:80"
+      - "443:443"
+
+    environment:
+      MANTICORE_DOMAIN: ${MANTICORE_DOMAIN}
+      MANTICORE_ACME_EMAIL: ${MANTICORE_ACME_EMAIL}
+      MANTICORE_USERNAME: ${MANTICORE_USERNAME}
+      MANTICORE_PASSWORD_HASH: ${MANTICORE_PASSWORD_HASH}
+
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+    depends_on:
+      manticore:
+        condition: service_healthy
+
+    networks:
+      - manticore
+
+networks:
+  manticore:
+    driver: bridge
+
+volumes:
+  caddy_data:
+  caddy_config:
