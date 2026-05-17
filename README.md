@@ -1110,57 +1110,77 @@ git update-index --chmod=+x ./config
 
 ## Troubleshooting
 
-**`permission denied while trying to connect to the Docker API at
-unix:///var/run/docker.sock`** — your user is not in the `docker` group. See
+### Permission denied connecting to the Docker daemon
+
+If you see:
+
+```
+permission denied while trying to connect to the Docker API at
+unix:///var/run/docker.sock
+```
+
+— your user is not in the `docker` group. See
 step 8 of [Install Docker](#install-docker-on-ubuntu-2404-lts).
 
-**`docker compose ps` shows `(unhealthy)`** — inspect the last healthcheck
-attempts:
+### Container shows `(unhealthy)` status
+
+`docker compose ps` reports `(unhealthy)` for `manticore`. Inspect the
+last healthcheck attempts:
 
 ```bash
 docker inspect manticore --format '{{json .State.Health}}' | python3 -m json.tool
 ```
 
-Look at the `Log` array — each entry has an `Output` field containing the
-stderr/stdout of the probe command. If you see `wget: command not found` or
-a network error, the container has not been recreated since the
-`docker-compose.yml` was edited:
+Look at the `Log` array — each entry has an `Output` field containing
+the stderr/stdout of the probe command. If you see `wget: command not
+found` or a network error, the container has not been recreated since
+the `docker-compose.yml` was edited:
 
 ```bash
 docker compose up -d --force-recreate manticore
 ```
 
-**`WARN[0000] The "xyz" variable is not set. Defaulting to a blank string`**
-when running any `docker compose` command — Compose is trying to interpolate
-a `$xyz...` substring it found inside one of your `.env` values. This
-almost always means `MANTICORE_PASSWORD_HASH` was written without the
-required `$$` escaping. Regenerate it using the bundled helper:
+### `WARN` about an unset variable found inside a value
 
-```bash
-docker compose --profile public down
-./config password generate
-docker compose --profile public up -d
+When running any `docker compose` command you see:
+
+```
+WARN[0000] The "xyz" variable is not set. Defaulting to a blank string.
 ```
 
-After the fix, `MANTICORE_PASSWORD_HASH` in `.env` should start with
-`$$2a$$` or `$$2b$$` (doubled dollars), and there should be no WARN
-messages on subsequent commands.
+— Compose is trying to interpolate a `$xyz...` substring it found inside
+one of your `.env` values. This almost always means
+`MANTICORE_PASSWORD_HASH` was written without the required `$$` escaping
+(typically by editing `.env` by hand with single dollars). Regenerate it
+using the bundled helper, which writes the value correctly:
 
-**`./config` prompts don't respond to `y` at the confirmation prompt** —
-the wrapper already passes `-it` to `docker compose run`. If you're
-invoking the underlying compose service directly (without the wrapper),
+```bash
+./config password generate
+```
+
+If the stack is running, the wrapper will also recreate Caddy
+automatically so it picks up the corrected value. After the fix,
+`MANTICORE_PASSWORD_HASH` in `.env` should start with `$$2a$$` or
+`$$2b$$` (doubled dollars), and there should be no WARN messages on
+subsequent commands.
+
+### `./config` prompts don't respond to `y` at the confirmation step
+
+The wrapper already passes `-it` to `docker compose run`. If you're
+invoking the underlying Compose service directly (without the wrapper),
 make sure to pass both flags:
 
 ```bash
 docker compose run --rm -it config password generate
 ```
 
-Without `-it`, Compose may not allocate a TTY, and `read` silently treats
-the prompt as cancelled.
+Without `-it`, Compose may not allocate a TTY, and `read` silently
+treats the prompt as cancelled.
 
-**`docker compose config --services` does not list `caddy` or `config`**
-— these services have `profiles:` and are hidden from `config --services`
-unless the matching profiles are explicitly active:
+### `docker compose config --services` does not list `caddy` or `config`
+
+Services with `profiles:` are hidden from `config --services` unless the
+matching profiles are explicitly active:
 
 ```bash
 docker compose --profile public --profile tools config --services
@@ -1170,11 +1190,13 @@ This is documented Compose behaviour, not a bug. Helper commands like
 `docker compose run --rm <service>` activate the matching profile
 automatically.
 
-**I changed the password (or username, or domain) via `./config`, but
-Caddy still rejects the new credentials.** This is expected — Docker
-container environment variables are fixed at container creation time
-and are not re-read when `.env` changes. You need to recreate the Caddy
-container to pick up the new value:
+### Caddy still rejects new credentials after changing `.env`
+
+You changed the password (or username, or domain) via `./config`, but
+Caddy still responds with `401 Unauthorized` to the new credentials.
+This is expected — Docker container environment variables are fixed at
+container creation time and are not re-read when `.env` changes. You
+need to recreate the Caddy container to pick up the new value:
 
 ```bash
 docker compose --profile public up -d --force-recreate caddy
@@ -1192,16 +1214,26 @@ This must show a hash with **single** dollars (`$2a$14$...`), not double
 interpolation; by the time the value reaches Caddy, it has been
 de-doubled.
 
-**Caddy fails to obtain a Let's Encrypt certificate** — typical causes:
+> When you use `./config` through the wrapper, this recreate happens
+> automatically — the wrapper detects that `.env` changed and a Caddy
+> container is running, then issues the `--force-recreate caddy` for
+> you. This entry covers the case where you edited `.env` outside the
+> helper (manually, via Ansible playbook, etc.), or invoked the
+> in-container `config` service directly without the wrapper.
 
-- Your domain's `A` record does not point at this VPS, or DNS has not yet
-  propagated. Verify with `dig +short search.example.com @1.1.1.1`.
+### Caddy fails to obtain a Let's Encrypt certificate
+
+Typical causes, in rough order of likelihood:
+
+- Your domain's `A` record does not point at this VPS, or DNS has not
+  yet propagated. Verify with `dig +short search.example.com @1.1.1.1`.
 - Port 80 is blocked by the host firewall or a cloud provider's network
   ACL. ACME's `http-01` challenge requires inbound 80; Caddy listens on
   it for that purpose. Check `sudo ufw status` and any provider firewall.
-- Another service is already listening on port 80 (system Nginx or
-  Apache). Stop it (`sudo systemctl stop nginx`) or use a host that does
-  not also serve websites for the Manticore endpoint.
+- Another service is already listening on port 80 (system nginx or
+  Apache). Stop it (`sudo systemctl stop nginx`) or use a host that
+  does not also serve other websites — see
+  [Scenario B prerequisites](#scenario-b--public-https-endpoint-with-caddy).
 - Let's Encrypt rate limit reached after multiple failed attempts. Wait
   one hour, fix the underlying problem (DNS, firewall), and retry.
 
@@ -1211,16 +1243,19 @@ Check Caddy's diagnostic output:
 docker compose logs caddy --tail=100
 ```
 
-**`failed to allocate memlock`** in Manticore logs — your kernel does not
-allow unlimited memory locking. The stack requests `memlock=-1:-1` via
-`ulimits`. If your provider's kernel disallows this, comment out the
-`memlock` lines in `docker-compose.yml`; Manticore will still work, just
-slightly less efficiently for very large indexes.
+### `failed to allocate memlock` in Manticore logs
 
-**Where is my data?** Manticore's data is stored in a Docker-managed
-named volume called `manticore-docker_manticore-data`, not in a folder
-next to `docker-compose.yml`. The volume survives `docker compose down`
-and `docker compose up`. To inspect the location on the host:
+Your kernel does not allow unlimited memory locking. The stack requests
+`memlock=-1:-1` via `ulimits`. If your provider's kernel disallows this,
+comment out the `memlock` lines in `docker-compose.yml`; Manticore will
+still work, just slightly less efficiently for very large indexes.
+
+### Where is my data?
+
+Manticore's data is stored in a Docker-managed named volume called
+`manticore-docker_manticore-data`, not in a folder next to
+`docker-compose.yml`. The volume survives `docker compose down` and
+`docker compose up`. To inspect the location on the host:
 
 ```bash
 docker volume inspect manticore-docker_manticore-data --format '{{ .Mountpoint }}'
@@ -1229,8 +1264,8 @@ docker volume inspect manticore-docker_manticore-data --format '{{ .Mountpoint }
 This typically prints something like
 `/var/lib/docker/volumes/manticore-docker_manticore-data/_data` —
 root-owned, so reading it requires `sudo`. For backup or restore, see
-the [Operations](#operations) section above which uses helper
-containers rather than direct host access.
+the [Operations](#operations) section above which uses helper containers
+rather than direct host access.
 
 To start from scratch and destroy all indexed content:
 
@@ -1242,17 +1277,23 @@ The `-v` flag tells Compose to also delete named volumes — both
 Manticore's data and Caddy's TLS certificates will be gone, and a fresh
 `up -d` starts with an empty Manticore and a new ACME registration.
 
-**I forgot the Basic Auth password.** The bcrypt hash in `.env` is
-one-way; the plaintext cannot be recovered. Generate a new one:
+### I forgot the Basic Auth password
+
+The bcrypt hash in `.env` is one-way; the plaintext cannot be recovered.
+Generate a new one:
 
 ```bash
-docker compose --profile public down
 ./config password generate
-docker compose --profile public up -d
 ```
 
-Don't forget to update the Drupal Search API server configuration with the
-new password afterwards.
+The helper writes the new hash to `.env`, prints the plaintext password
+once, and — if the stack is running — silently recreates Caddy so the
+new credentials take effect immediately. No `down`/`up` cycle needed.
+**Copy the plaintext password to a password manager before pressing
+Enter to dismiss the output** — it will not be shown again.
+
+Don't forget to update the Drupal Search API server configuration with
+the new password afterwards.
 
 
 ## License
