@@ -11,14 +11,25 @@
 #   ./config email admin@example.com
 #   ./config username drupal
 #   ./config password generate
-#   ./config password change 'my-strong-password'
+#   ./config password change
 #   ./config setup
 #   ./config help
 #
-# This wrapper exists so you don't have to repeat the verbose
-# `HOST_UID=$(id -u) HOST_GID=$(id -g) docker compose run --rm -it config ...`
-# incantation. Everything is forwarded to the bin/config.sh script running
-# inside the `config` Compose service.
+# Beyond forwarding arguments, the wrapper does two host-side things
+# that the in-container script cannot:
+#
+#   1. Detects whether the manticore-caddy container is currently
+#      running and forwards the result to the container as
+#      CADDY_RUNNING=yes|no. The script uses this to tailor next-steps
+#      output to the actual stack state.
+#
+#   2. After the subcommand exits, checks the exit code:
+#        - 0     no .env change (e.g. 'show', or a wizard aborted)
+#                — nothing further to do.
+#        - 10    .env was modified — if Caddy is currently running,
+#                silently recreate it so the new value takes effect.
+#                Any other exit code is treated as a real failure and
+#                propagated as-is; no recreate is performed.
 #
 # If `./config` fails to run with "permission denied", restore the bit:
 #   chmod +x ./config
@@ -27,14 +38,50 @@
 
 set -eu
 
-# Resolve the directory containing this script so the wrapper can be
-# invoked from any working directory (e.g. `~/projects/manticore-docker/config`
-# from elsewhere). All subsequent commands run with that directory as cwd
-# so docker compose finds docker-compose.yml.
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-exec docker compose run --rm -it \
+# -----------------------------------------------------------------------------
+# Detect whether the Caddy container is currently running. Exact name match
+# on a running container (-a not passed, so stopped containers don't count).
+# -----------------------------------------------------------------------------
+CADDY_RUNNING=no
+if docker ps --filter "name=^manticore-caddy$" --format '{{.Names}}' 2>/dev/null \
+        | grep -q '^manticore-caddy$'; then
+    CADDY_RUNNING=yes
+fi
+
+# -----------------------------------------------------------------------------
+# Run the subcommand. Disable errexit around the call so we can capture
+# the exit code and react to it.
+# -----------------------------------------------------------------------------
+set +e
+docker compose run --rm -it \
     -e HOST_UID="$(id -u)" \
     -e HOST_GID="$(id -g)" \
+    -e CADDY_RUNNING="$CADDY_RUNNING" \
     config "$@"
+RC=$?
+set -e
+
+# -----------------------------------------------------------------------------
+# Interpret the exit code:
+#   10            .env changed — proceed to the recreate logic below.
+#   0             no change — exit 0 silently.
+#   anything else real error — propagate verbatim.
+# -----------------------------------------------------------------------------
+if [ "$RC" -eq 0 ]; then
+    exit 0
+fi
+if [ "$RC" -ne 10 ]; then
+    exit "$RC"
+fi
+
+# -----------------------------------------------------------------------------
+# .env was modified. If Caddy is running, recreate it so the new value
+# takes effect. If not, there is nothing to do — the value will be
+# picked up the next time the stack is brought up.
+# -----------------------------------------------------------------------------
+if [ "$CADDY_RUNNING" = "yes" ]; then
+    docker compose --profile public up -d --force-recreate caddy
+fi

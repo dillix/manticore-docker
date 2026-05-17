@@ -42,16 +42,33 @@ installation as `http://127.0.0.1:9308`. No TLS or authentication is needed
 because the port is not exposed to the network. Best for small blogs and
 wikis (≈ 1k–5k nodes) running on a single host.
 
-**Scenario B — Two VPS, public endpoint.** Drupal runs on one server,
-Manticore on another. The bundled Caddy reverse proxy terminates TLS
-(automatic Let's Encrypt certificate) and enforces HTTP Basic Authentication
-in front of Manticore's HTTP API. Only ports `80` and `443` are exposed
-publicly; Manticore itself binds to `127.0.0.1` inside the host. Best for
-medium-to-large sites (tens of thousands of documents and up) where the
-search server is dedicated.
+The same setup also covers the case where you already run nginx, Apache,
+or any other web server on the host: keep Manticore on `127.0.0.1` and
+add a reverse-proxy block (with TLS and Basic Auth) to your existing web
+server. The Manticore stack itself stays unchanged; only your web server
+config grows by one location block. See the
+[Scenario A deployment section](#scenario-a--single-vps) below.
 
-You choose between the two scenarios with a single Docker Compose flag.
-Switching later is also possible.
+**Scenario B — Dedicated Manticore VPS with public endpoint.** Drupal
+runs on one server, Manticore on a **separate, dedicated** server. The
+bundled Caddy reverse proxy terminates TLS (automatic Let's Encrypt
+certificate) and enforces HTTP Basic Authentication in front of
+Manticore's HTTP API. Manticore itself binds to `127.0.0.1` inside the
+host; only Caddy is publicly reachable, on ports `80` and `443`.
+
+This scenario **requires ports 80 and 443 to be free** on the Manticore
+VPS — nothing else can be listening on them, including any existing
+nginx, Apache, or other web server. Let's Encrypt's `http-01` challenge
+strictly validates on port 80; there is no way around this. **Best for
+medium-to-large sites (tens of thousands of documents and up) where the
+Manticore VPS has no other duties.** If this VPS already serves other
+websites and you cannot free ports 80/443, use the "behind your own
+reverse proxy" variant of Scenario A instead.
+
+You choose between Scenario A and Scenario B with a single Docker Compose
+flag. Switching later is also possible. The "behind your own reverse proxy"
+variant of Scenario A is purely a matter of your web server configuration —
+the Manticore stack does not need to be changed to support it.
 
 
 ## Requirements
@@ -64,8 +81,12 @@ Switching later is also possible.
 - **Docker Engine 24+** and **Docker Compose plugin v2+**
   (installation instructions below)
 - For Scenario B only:
-  - a **domain or subdomain** with an `A` record pointing to the VPS
-  - ports **80** and **443** open to the public internet
+  - a **dedicated VPS** for Manticore (no other web server on it)
+  - a **domain or subdomain** with an `A` record pointing to that VPS
+  - ports **80** and **443** must be **free** on that VPS (not just
+    open in the firewall — no other service may be listening on them).
+    See diagnostics in [Deploy the stack →
+    Scenario B](#scenario-b--public-https-endpoint-with-caddy)
 
 
 ## Install Docker on Ubuntu 24.04 LTS
@@ -202,28 +223,22 @@ Scenario B (all managed through the `./config` helper).
 
 **1. Clone the repository.**
 
-Pick a location. For a production deployment, `/opt/manticore-stack/` is the
-recommended FHS-compliant directory for self-managed services. For testing or
-development, anywhere in your home directory works:
+The recommended location for a self-managed service on Linux is
+`/opt/manticore/`, following the FHS convention:
 
 ```bash
-# Production deployment
-sudo git clone https://github.com/dillix/manticore-docker.git /opt/manticore-stack
-sudo chown -R $USER:$USER /opt/manticore-stack
-cd /opt/manticore-stack
-
-# Or, for development
-mkdir -p ~/Projects && cd ~/Projects
-git clone git@github.com:dillix/manticore-docker.git
-cd manticore-docker
+sudo git clone https://github.com/dillix/manticore-docker.git /opt/manticore
+sudo chown -R $USER:$USER /opt/manticore
+cd /opt/manticore
 ```
 
-Use the HTTPS URL for read-only deployment, or the SSH URL if you plan to
-contribute. The `chown` step transfers ownership to the current user so that
-all subsequent `docker compose` commands can be run without `sudo` (assuming
+Use the HTTPS URL for read-only deployment, or the SSH URL
+(`git@github.com:dillix/manticore-docker.git`) if you plan to contribute.
+The `chown` step transfers ownership to the current user so that all
+subsequent `docker compose` commands can be run without `sudo` (assuming
 your user is in the `docker` group, see installation step 8 above).
 
-### Scenario A — single VPS, no public endpoint
+### Scenario A — single VPS
 
 ```bash
 docker compose up -d
@@ -257,11 +272,195 @@ protocol port, not exposed to the host at all.
 
 You can now point your local Drupal site at `http://127.0.0.1:9308`.
 
+#### Exposing Manticore through your existing reverse proxy
+
+If your Drupal site runs on a **different** server, you need a public
+HTTPS endpoint for it to reach Manticore. There are two ways to do this:
+
+1. Use the bundled Caddy reverse proxy — see
+   [Scenario B](#scenario-b--public-https-endpoint-with-caddy) below.
+   Best if Manticore is on a dedicated VPS with ports `80` and `443` free.
+
+2. **Use your existing nginx** on this host — the rest of this section.
+   Best if this VPS already serves other websites and ports `80`/`443`
+   are taken.
+
+The Manticore stack stays exactly as in Scenario A — bound to
+`127.0.0.1:9308`, no Caddy, no public ports. Your existing nginx adds
+**one extra `server` block** that terminates TLS, checks Basic Auth, and
+proxies into Manticore on localhost. From Drupal's point of view the
+result is identical to Scenario B.
+
+**Step 1. Generate Basic Auth credentials.**
+
+Install `htpasswd` if you don't have it:
+
+```bash
+sudo apt install apache2-utils
+```
+
+Create a credentials file in nginx's config directory:
+
+```bash
+sudo htpasswd -cB /etc/nginx/.htpasswd-manticore drupal
+# Enter a strong password when prompted. Save it — you'll paste it
+# into Drupal's Search API server form later.
+```
+
+The `-B` flag selects bcrypt (the same hash family Scenario B's Caddy
+uses). `-c` creates the file. For subsequent users on the same file,
+omit `-c`.
+
+**Step 2. Add the nginx server block.**
+
+Pick a hostname for the endpoint, for example `search.example.com`, and
+ensure its DNS `A` record points to this VPS. Then create a new file
+`/etc/nginx/sites-available/manticore.conf` with the following content:
+
+```nginx
+# Manticore Search reverse proxy with Basic Auth and TLS.
+# Manticore itself listens on 127.0.0.1:9308 (from the Docker stack);
+# this server block makes it reachable as https://search.example.com.
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name search.example.com;
+
+    # TLS — replace with your actual certificate paths. If you don't
+    # have certificates yet, see Step 3 below for certbot.
+    ssl_certificate     /etc/letsencrypt/live/search.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/search.example.com/privkey.pem;
+
+    # Modern TLS defaults. Adjust to match the rest of your sites if you
+    # already have a shared snippet.
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers off;
+
+    # HTTP Basic Authentication. The realm string is shown by browsers
+    # in the password prompt; the user-file holds bcrypt-hashed creds.
+    auth_basic           "Manticore Search";
+    auth_basic_user_file /etc/nginx/.htpasswd-manticore;
+
+    # Proxy everything into the Manticore container.
+    location / {
+        proxy_pass         http://127.0.0.1:9308;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+
+        # Manticore responses can be large for big result sets — give the
+        # proxy room to forward them without buffering to disk.
+        proxy_buffering    off;
+        client_max_body_size 64M;
+    }
+
+    # Strip the Authorization header before forwarding to Manticore.
+    # Auth is enforced by nginx; Manticore itself has no auth and should
+    # never see the credentials.
+    proxy_set_header Authorization "";
+}
+
+# Plain-HTTP redirect to HTTPS. Required for browsers that hit the
+# bare hostname, and for Let's Encrypt's HTTP-01 challenge.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name search.example.com;
+    return 301 https://$host$request_uri;
+}
+```
+
+Enable the site and reload nginx:
+
+```bash
+sudo ln -s /etc/nginx/sites-available/manticore.conf \
+           /etc/nginx/sites-enabled/manticore.conf
+sudo nginx -t                  # validate the configuration
+sudo systemctl reload nginx
+```
+
+**Step 3. (If needed) Obtain a TLS certificate.**
+
+If your existing nginx already uses certbot for other domains:
+
+```bash
+sudo certbot --nginx -d search.example.com
+```
+
+Certbot reads the new vhost, adds the certificate paths automatically,
+and reloads nginx. If you use a different ACME client (acme.sh, lego,
+manual ISPmanager workflow, etc.), follow its usual procedure for adding
+a new domain — there's nothing Manticore-specific.
+
+**Step 4. Verify from outside the VPS.**
+
+```bash
+# Without credentials — expect HTTP/2 401:
+curl -sI https://search.example.com/cli
+
+# With credentials — expect Manticore status table:
+curl -s -u 'drupal:your-password' https://search.example.com/cli \
+     -d 'SHOW STATUS' | head -5
+```
+
+The `401` response confirms TLS and Basic Auth are active; the table
+confirms Manticore is reachable through the proxy. From Drupal's
+configuration page, fill in:
+
+- **Host:** `search.example.com`
+- **Port:** `443`
+- **Path:** (empty)
+- **Use HTTPS:** yes
+- **HTTP Basic Auth username:** `drupal`
+- **HTTP Basic Auth password:** the value you set in Step 1
+
+> **Why not just bind Manticore to `0.0.0.0:9308`?**
+> Manticore has no built-in authentication. Binding it to a public
+> interface — even "temporarily, while I set up nginx" — exposes the
+> database directly to the internet. Automated scrapers index public
+> ports within seconds; databases left exposed this way are routinely
+> wiped or ransom-locked. The 127.0.0.1 binding plus a reverse proxy is
+> the safe pattern; never open 9308 to the public.
+
 ### Scenario B — public HTTPS endpoint with Caddy
 
 Scenario B adds a Caddy reverse proxy in front of Manticore. Caddy obtains
 a Let's Encrypt TLS certificate automatically and enforces HTTP Basic
 Authentication on every request.
+
+> **⚠ Prerequisites before you start.**
+>
+> - **This VPS must be dedicated to the Manticore stack.** Caddy needs
+>   exclusive ownership of ports **80** and **443**, and Let's Encrypt's
+>   `http-01` challenge cannot validate on a non-standard port. If this
+>   VPS also runs nginx, Apache, or any other web server on those ports,
+>   Caddy will fail to start.
+>
+> - **Verify ports 80 and 443 are free** before proceeding:
+>
+>   ```bash
+>   sudo ss -tlnp | grep -E ':(80|443) '
+>   ```
+>
+>   If the output is empty, you're good. If it shows another process
+>   (typically `nginx` or `apache2`), either stop and disable that
+>   service, move it to a different VPS, or use the
+>   ["behind your own reverse proxy"](#exposing-manticore-through-your-existing-reverse-proxy)
+>   variant of Scenario A instead.
+>
+> - **DNS must point at this VPS already.** Let's Encrypt validates
+>   ownership immediately on first start; if the `A` record hasn't
+>   propagated yet, certificate issuance will fail. Verify with:
+>
+>   ```bash
+>   dig +short search.example.com @1.1.1.1
+>   ```
+>
+>   The output should match this VPS's public IP.
 
 All configuration is managed through the `./config` helper, a thin wrapper
 around `docker compose run --rm -it config` (see [Configuration helper
@@ -270,28 +469,45 @@ list).
 
 **1. Configure the four required `.env` values.**
 
-You can configure each value individually:
+The fastest path is the interactive setup wizard:
 
 ```bash
-./config domain   search.example.com
-./config email    admin@example.com
-./config username drupal
-./config password generate
+./config setup
 ```
 
-Each command shows a preview of the planned change and asks for
-confirmation. The `.env` file is created automatically from `.env.example`
-the first time you run any of them.
-
-Replace `search.example.com`, `admin@example.com`, and `drupal` with your
-own values. The domain must have a public DNS `A` record pointing at this
-VPS before you continue — Let's Encrypt will validate ownership by sending
-an HTTP request to `http://<your-domain>/.well-known/acme-challenge/...`
-within seconds of starting Caddy.
-
-When you run `./config password generate`, you will see output like this:
+It walks you through all four values in a single guided flow:
 
 ```
+============================================================
+  Manticore Search Docker Stack — interactive setup
+============================================================
+
+Creating .env from .env.example.
+
+Step 1 of 4 — Domain name
+The fully-qualified hostname pointing at this VPS, with a public
+DNS A record. Example: search.example.com
+
+Domain: search.example.com
+
+Step 2 of 4 — ACME email
+Email address used by Let's Encrypt for renewal notices.
+
+Email: admin@example.com
+
+Step 3 of 4 — HTTP Basic Auth username
+Username the Drupal application will authenticate as.
+
+Username: drupal
+
+Step 4 of 4 — HTTP Basic Auth password
+How would you like to set the password?
+
+  1) Generate a strong random password (recommended)
+  2) Enter your own password
+
+Choice [1]: 1
+
 ============================================================
   PASSWORD (save this NOW — it will not be shown again):
 
@@ -299,26 +515,54 @@ When you run `./config password generate`, you will see output like this:
 
 ============================================================
 
+Summary
 
-  + MANTICORE_PASSWORD_HASH=$$2a$$14$$q2ZtT2gmqTmRgPCB1jG8f.eveOC/yFa1eSJY2rpJ94fLk8otYiP52
+  MANTICORE_DOMAIN       = search.example.com
+  MANTICORE_ACME_EMAIL   = admin@example.com
+  MANTICORE_USERNAME     = drupal
+  MANTICORE_PASSWORD_HASH= $$2a$$14$$••••••••
 
-Apply this change? [y/N] y
-Updated MANTICORE_PASSWORD_HASH.
+Write these values to .env? [y/N] y
+
+Setup complete. .env has been written.
 ```
 
 **Copy the plaintext password to a password manager before answering `y`.**
-It will not be shown again, and you will need it later when configuring the
-Search API server in Drupal.
+It will not be shown again, and you will need it later when configuring
+the Search API server in Drupal.
 
-If you prefer to use a password of your own choosing instead of a random
-one, use `password change` instead:
+The domain you enter must have a public DNS `A` record pointing at this
+VPS before you continue — Let's Encrypt will validate ownership by
+sending an HTTP request to
+`http://<your-domain>/.well-known/acme-challenge/...` within seconds of
+starting Caddy.
+
+If you chose option **2** (enter your own password), you will be prompted
+twice with hidden input. The password is **never** accepted as a
+command-line argument — arguments are recorded in shell history, visible
+in `ps auxw` while the command runs, and may end up in SSH session logs.
+For non-interactive deployment (Ansible, CI), ship a pre-populated
+`.env` file via your configuration management tool instead.
+
+<details>
+<summary>Alternative: configure each value individually</summary>
+
+If you prefer to set values one at a time (for example, to update just
+one field after the initial setup), use the individual subcommands:
 
 ```bash
-./config password change 'your-strong-password'
+./config domain   search.example.com
+./config email    admin@example.com
+./config username drupal
+./config password generate          # random password + hash
+./config password change            # prompt for password interactively
 ```
 
-Wrap the password in **single quotes** — characters like `$`, `!`, `&`
-may be interpreted by your host shell otherwise.
+Each command shows a preview of the planned change and asks for
+confirmation. The `.env` file is created automatically from
+`.env.example` the first time you run any of them.
+
+</details>
 
 > **Why are there `$$` in the hash?** Compose interpolates values loaded
 > from `.env` when substituting them into `docker-compose.yml`. A bcrypt
@@ -326,7 +570,7 @@ may be interpreted by your host shell otherwise.
 > `$2a`, `$14`, and `$XXXX` as variable references. Doubling each `$`
 > escapes the interpolation; Compose strips one `$` from each pair when
 > passing the value to Caddy, which then sees the correct single-`$` hash.
-> The `./config password` commands handle this for you; never edit
+> The `./config` commands handle this for you; never edit
 > `MANTICORE_PASSWORD_HASH` by hand.
 
 **2. Verify `.env` is complete.**
@@ -607,6 +851,17 @@ this Manticore instance.
 - Password: the plaintext password whose bcrypt hash is in
   `MANTICORE_PASSWORD_HASH`
 
+**Scenario A behind your own reverse proxy — Drupal anywhere:**
+
+- Backend: `Manticore Search`
+- Host: the hostname you configured in your nginx server block
+  (e.g. `search.example.com`)
+- Port: `443`
+- HTTPS: enabled
+- Authentication: HTTP Basic Auth
+- Username: the username you passed to `htpasswd` (e.g. `drupal`)
+- Password: the password you set when creating the htpasswd entry
+
 Refer to the module's documentation for the exact form field names and any
 additional options.
 
@@ -626,8 +881,30 @@ docker compose --profile public up -d         # Scenario B (with Caddy)
 **Stop the stack** (containers removed, data preserved):
 
 ```bash
-docker compose down
+docker compose down                       # Scenario A
+docker compose --profile public down      # Scenario B (with Caddy)
 ```
+
+> **Watch the `--profile` flag.** Compose only sees services from
+> profiles you activate. Running plain `docker compose down` on a stack
+> started with `--profile public` will stop and remove `manticore` but
+> leave `manticore-caddy` running on its own. Always pass the same
+> `--profile` flags to `down` that you passed to `up`. If you forgot
+> and ended up with an orphan Caddy, just rerun with the profile:
+>
+> ```bash
+> docker compose --profile public down
+> ```
+
+If you also want to wipe persistent data (Manticore tables, Caddy's
+TLS certificates), add `-v` to remove named volumes too:
+
+```bash
+docker compose --profile public down -v
+```
+
+This is destructive — see [Where is my data?](#troubleshooting) before
+running it.
 
 **Restart Manticore only:**
 
@@ -667,6 +944,13 @@ FROM <table>`, `OPTIMIZE`, `FLUSH RAMCHUNK`, etc.
 ./config domain   search.new.com      # change domain (will need to re-issue cert)
 ```
 
+After changing any value used by Caddy (domain, email, username, or
+password), recreate the Caddy container so it picks up the new value:
+
+```bash
+docker compose --profile public up -d --force-recreate caddy
+```
+
 See [Configuration helper reference](#configuration-helper-reference)
 for the full list of subcommands.
 
@@ -684,17 +968,51 @@ for the full list of subcommands.
 3. Verify with `docker compose logs manticore --tail=20` that the new
    version is running.
 
-**Back up your data.** The `./data` directory contains all tables. To take a
-consistent snapshot, use Manticore's built-in physical backup tool:
+**Back up your data.** Manticore's data lives in the `manticore-data`
+Docker named volume. To get its location on the host:
+
+```bash
+docker volume inspect manticore-docker_manticore-data --format '{{ .Mountpoint }}'
+```
+
+For a consistent application-level snapshot (preferred for production),
+use Manticore's built-in backup tool:
 
 ```bash
 docker exec manticore manticore-backup --backup-dir=/var/lib/manticore/backups
 ```
 
-The backup is written inside the container's `/var/lib/manticore/backups`,
-which maps to `./data/backups` on the host. Copy it off the VPS for
-durability. For details and restore procedure, see
-[Manticore's backup docs](https://manual.manticoresearch.com/Securing_and_compacting_a_table/Backup_and_restore).
+The backup is written to `/var/lib/manticore/backups` inside the
+container, which is also inside the `manticore-data` volume.
+See [Manticore's backup docs](https://manual.manticoresearch.com/Securing_and_compacting_a_table/Backup_and_restore)
+for details and the restore procedure.
+
+For a raw volume-level snapshot (faster, useful for whole-host backups),
+archive the entire volume into a tarball via a one-shot helper container:
+
+```bash
+docker run --rm \
+    -v manticore-docker_manticore-data:/data:ro \
+    -v "$(pwd)":/backup \
+    alpine \
+    tar czf /backup/manticore-data-$(date +%F).tar.gz -C /data .
+```
+
+This produces `manticore-data-YYYY-MM-DD.tar.gz` in the current
+directory. Copy it off the VPS for durability.
+
+To restore from a tarball (stop the stack first so nothing writes
+during the restore):
+
+```bash
+docker compose --profile public down
+docker run --rm \
+    -v manticore-docker_manticore-data:/data \
+    -v "$(pwd)":/backup \
+    alpine \
+    sh -c "rm -rf /data/* && tar xzf /backup/manticore-data-YYYY-MM-DD.tar.gz -C /data"
+docker compose --profile public up -d
+```
 
 
 ## Configuration helper reference
@@ -737,18 +1055,22 @@ identical to the current one, the command reports `No change` and exits.
 
 ```bash
 ./config password generate            # random 24-char password + hash
-./config password change 'my-pwd'     # hash a specific password
+./config password change              # prompts for password interactively
 ```
 
 The `generate` form prints the plaintext password once in a clearly
 framed block — **save it immediately**; it is not stored anywhere on
-disk in cleartext. Both commands write the bcrypt hash to
-`MANTICORE_PASSWORD_HASH` in `.env` with the required `$$` escaping for
-Compose interpolation.
+disk in cleartext.
 
-Always wrap the password in **single quotes** when using `change` —
-characters like `$`, `!`, `&` are interpreted by the host shell
-otherwise.
+The `change` form prompts for the password twice (input is hidden via
+`stty -echo`), with a confirmation step that re-prompts on mismatch.
+The password is **never** accepted as a command-line argument because
+arguments are recorded in shell history, visible in `ps auxw` during
+execution, and may end up in SSH session logs. For non-interactive
+deployment, ship a pre-populated `.env` via Ansible/Puppet/etc. instead.
+
+Both commands write the bcrypt hash to `MANTICORE_PASSWORD_HASH` in
+`.env` with the required `$$` escaping for Compose interpolation.
 
 **Interactive setup wizard:**
 
@@ -756,8 +1078,11 @@ otherwise.
 ./config setup
 ```
 
-Walks you through all four values in a single guided flow — useful for
-first-time deployment. _(Coming soon — currently shows a stub message.)_
+Walks you through all four values in a single guided flow — recommended
+for first-time deployment. If `.env` already exists and is fully
+populated, the wizard asks before overwriting. The password step lets
+you choose between auto-generated and manually entered (with confirmed
+input).
 
 **Help:**
 
@@ -845,6 +1170,28 @@ This is documented Compose behaviour, not a bug. Helper commands like
 `docker compose run --rm <service>` activate the matching profile
 automatically.
 
+**I changed the password (or username, or domain) via `./config`, but
+Caddy still rejects the new credentials.** This is expected — Docker
+container environment variables are fixed at container creation time
+and are not re-read when `.env` changes. You need to recreate the Caddy
+container to pick up the new value:
+
+```bash
+docker compose --profile public up -d --force-recreate caddy
+```
+
+The Manticore container does not need recreation; only Caddy depends on
+the `.env` values. Verify the new value reached Caddy:
+
+```bash
+docker exec manticore-caddy printenv MANTICORE_PASSWORD_HASH
+```
+
+This must show a hash with **single** dollars (`$2a$14$...`), not double
+(`$$2a$$...`). The doubling only exists in `.env` to survive Compose
+interpolation; by the time the value reaches Caddy, it has been
+de-doubled.
+
 **Caddy fails to obtain a Let's Encrypt certificate** — typical causes:
 
 - Your domain's `A` record does not point at this VPS, or DNS has not yet
@@ -870,10 +1217,30 @@ allow unlimited memory locking. The stack requests `memlock=-1:-1` via
 `memlock` lines in `docker-compose.yml`; Manticore will still work, just
 slightly less efficiently for very large indexes.
 
-**Where is my data?** The `./data` directory next to `docker-compose.yml`.
-It survives `docker compose down` and `docker compose up`. To start from
-scratch, `docker compose down` then `rm -rf ./data` — but this destroys all
-indexed content.
+**Where is my data?** Manticore's data is stored in a Docker-managed
+named volume called `manticore-docker_manticore-data`, not in a folder
+next to `docker-compose.yml`. The volume survives `docker compose down`
+and `docker compose up`. To inspect the location on the host:
+
+```bash
+docker volume inspect manticore-docker_manticore-data --format '{{ .Mountpoint }}'
+```
+
+This typically prints something like
+`/var/lib/docker/volumes/manticore-docker_manticore-data/_data` —
+root-owned, so reading it requires `sudo`. For backup or restore, see
+the [Operations](#operations) section above which uses helper
+containers rather than direct host access.
+
+To start from scratch and destroy all indexed content:
+
+```bash
+docker compose --profile public down -v
+```
+
+The `-v` flag tells Compose to also delete named volumes — both
+Manticore's data and Caddy's TLS certificates will be gone, and a fresh
+`up -d` starts with an empty Manticore and a new ACME registration.
 
 **I forgot the Basic Auth password.** The bcrypt hash in `.env` is
 one-way; the plaintext cannot be recovered. Generate a new one:

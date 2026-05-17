@@ -1,10 +1,7 @@
 # Local environment configuration — contains secrets, never commit
 .env
 
-# Manticore persistent data volume
-data/
-
-# OS / editor artifacts
+# OS / Editor artifacts
 .DS_Store
 *.swp
 *.swo

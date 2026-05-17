@@ -2,10 +2,12 @@
 # https://github.com/dillix/manticore-docker
 #
 # Usage:
-#   Scenario A (single VPS, local only):
+#   Scenario A (single VPS — local Drupal, or reachable via your own
+#               existing reverse proxy with TLS+auth):
 #     docker compose up -d
 #
-#   Scenario B (two VPS, public HTTPS endpoint with Caddy):
+#   Scenario B (dedicated Manticore VPS with bundled Caddy reverse proxy
+#               providing TLS + Basic Auth automatically):
 #     docker compose --profile public up -d
 #
 # Configuration is in the .env file; copy .env.example to .env first.
@@ -27,7 +29,19 @@ services:
       - "127.0.0.1:9308:9308"   # HTTP/JSON API (used by Drupal)
 
     volumes:
-      - ./data:/var/lib/manticore
+      # Named volume managed by Docker. Stored under
+      # /var/lib/docker/volumes/manticore-docker_manticore-data on the host
+      # (the exact path depends on the Docker storage driver). Using a
+      # named volume instead of a bind mount avoids the UID-mismatch
+      # cosmetic issue where files in a host-mounted ./data directory
+      # appear to be owned by whatever host user happens to share the
+      # 999 UID with the in-container `manticore` user.
+      #
+      # To inspect the data path on the host:
+      #   docker volume inspect manticore-docker_manticore-data
+      #
+      # For backup/restore procedures, see the README.
+      - manticore-data:/var/lib/manticore
 
     # Manticore performance-tuning recommendations from the official
     # Docker Hub image documentation:
@@ -120,5 +134,6 @@ networks:
     driver: bridge
 
 volumes:
+  manticore-data:
   caddy_data:
   caddy_config:
