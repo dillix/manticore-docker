@@ -20,6 +20,7 @@ Drupal module, but it is generic — any HTTP client can talk to it.
 
 - [Deployment scenarios](#deployment-scenarios)
 - [Requirements](#requirements)
+- [Prerequisites: a sudo-capable non-root user](#prerequisites-a-sudo-capable-non-root-user)
 - [Install Docker on Ubuntu 24.04 LTS](#install-docker-on-ubuntu-2404-lts)
 - [Deploy the stack](#deploy-the-stack)
 - [Verify the installation](#verify-the-installation)
@@ -87,6 +88,52 @@ the Manticore stack does not need to be changed to support it.
     open in the firewall — no other service may be listening on them).
     See diagnostics in [Deploy the stack →
     Scenario B](#scenario-b--public-https-endpoint-with-caddy)
+
+
+## Prerequisites: a sudo-capable non-root user
+
+Before installing Docker, make sure you're working as a regular Linux
+user with `sudo` rights — **not** as `root`. Running services under root
+is bad practice (any mistake runs with full system privileges), and the
+rest of this guide is written for a non-root user who escalates with
+`sudo` when needed.
+
+If your VPS provider already gave you such a user, you can skip this
+section. Common defaults:
+
+- Hetzner Cloud, AWS: `ubuntu`, `admin`, or `root` (you must create your
+  own user if it's only `root`)
+- DigitalOcean: `root` only (unless you specified otherwise during
+  droplet creation)
+- Manual Ubuntu install: whatever you set during installation
+
+Check your current user and confirm `sudo` works:
+
+```bash
+whoami                # should NOT print 'root'
+sudo -v               # asks for your password, no error
+groups                # should include 'sudo' (or 'wheel' on RHEL-likes)
+```
+
+If `whoami` prints `root`, create a new user (you'll do this only once):
+
+```bash
+# As root, pick any name you like — examples: 'admin', 'ops', 'deploy':
+adduser <username>
+usermod -aG sudo <username>
+
+# Log out and reconnect as the new user.
+```
+
+SSH key setup, password policies, and other host-hardening topics are
+outside the scope of this guide — your VPS provider's documentation
+will cover them.
+
+From now on, all commands in this guide assume you're logged in as this
+non-root user. When `sudo` is required, the command will explicitly say
+so. After installing Docker, you'll also add this user to the `docker`
+group ([step 8](#install-docker-on-ubuntu-2404-lts) below) so that
+`docker` and `docker compose` commands work without `sudo`.
 
 
 ## Install Docker on Ubuntu 24.04 LTS
@@ -179,16 +226,19 @@ run Manticore.
 
 **8. Allow your regular user to run Docker without `sudo` (recommended).**
 
-Running the rest of this guide as `root` is possible but discouraged. To
-manage the stack as a non-root user (e.g. `webmaster`), add that user to the
-`docker` group:
+The `docker` group grants its members access to the Docker daemon socket,
+which is equivalent to root privileges on the host. Add the non-root user
+you set up in [Prerequisites](#prerequisites-a-sudo-capable-non-root-user)
+to that group so you can run `docker` and `docker compose` commands
+without typing `sudo` each time:
 
 ```bash
 sudo usermod -aG docker $USER
 ```
 
-Replace `$USER` with the target username if you are not currently logged in
-as that user. Verify the change took effect:
+`$USER` is automatically your current login name. If you want to grant
+access to a different user, replace `$USER` with that username. Verify
+the change took effect:
 
 ```bash
 getent group docker        # should list your user
