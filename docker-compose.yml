@@ -19,6 +19,19 @@ services:
     container_name: manticore
     restart: unless-stopped
 
+    # Server options applied via Manticore's Docker env-var convention
+    # (the official image maps any `searchd_<name>` env to the
+    # corresponding `<name>` directive in the [searchd] config section).
+    #
+    # searchd_not_terms_only_allowed=1 enables fulltext queries that
+    # contain only negative (NOT) terms — required by the
+    # search_api_manticore Drupal module
+    # (https://www.drupal.org/project/search_api_manticore) for its
+    # negation features. The option only relaxes a parser constraint;
+    # it has no performance impact when the feature isn't used.
+    environment:
+      searchd_not_terms_only_allowed: 1
+
     # Bind ports to 127.0.0.1 only — Manticore has no built-in
     # authentication, so it must never be exposed directly.
     # In Scenario B, Caddy (in the same Docker network) reaches it
@@ -79,17 +92,18 @@ services:
   #
   # Runs on demand only (profile=tools) — never started by `up -d`.
   #
-  # Usage:
-  #   docker compose run --rm -it config <subcommand> [args...]
+  # Usage (recommended — through the host-side wrapper):
+  #   ./config <subcommand> [args...]
   #
   # Examples:
-  #   docker compose run --rm -it config show
-  #   docker compose run --rm -it config domain search.example.com
-  #   docker compose run --rm -it config email admin@example.com
-  #   docker compose run --rm -it config username drupal
-  #   docker compose run --rm -it config password generate
-  #   docker compose run --rm -it config password change 'my-password'
-  #   docker compose run --rm -it config setup        (coming soon)
+  #   ./config show
+  #   ./config setup
+  #   ./config domain search.example.com
+  #   ./config email admin@example.com
+  #   ./config username drupal
+  #   ./config password generate
+  #   ./config password change         # interactive — never accepts the
+  #                                    # password as a CLI argument
   config:
     image: caddy:2-alpine
     profiles: ["tools"]

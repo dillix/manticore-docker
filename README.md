@@ -288,6 +288,33 @@ The `chown` step transfers ownership to the current user so that all
 subsequent `docker compose` commands can be run without `sudo` (assuming
 your user is in the `docker` group, see installation step 8 above).
 
+**2. Pre-configured server options.**
+
+This stack enables one non-default Manticore server option:
+`searchd_not_terms_only_allowed = 1`, set via the
+`searchd_not_terms_only_allowed` environment variable on the `manticore`
+service in `docker-compose.yml`. It allows fulltext queries containing
+only negative (NOT) terms — for example, _"show me all documents that
+do NOT mention `obsolete`"_ without a positive term to anchor the
+search.
+
+This option is required by the
+[Search API Manticore](https://www.drupal.org/project/search_api_manticore)
+Drupal module to support its negation features. If you use the stack
+standalone (without the module), the option is harmless: it relaxes a
+parser constraint without affecting performance.
+
+No action is needed from you — the option is applied automatically the
+first time you start the stack. If you ever edit `docker-compose.yml`
+to tune server options yourself, recreate the container so the new
+values take effect:
+
+```bash
+docker compose up -d --force-recreate manticore
+```
+
+Now choose your scenario:
+
 ### Scenario A — single VPS
 
 ```bash
