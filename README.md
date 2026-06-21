@@ -26,6 +26,7 @@ Drupal module, but it is generic — any HTTP client can talk to it.
 - [Verify the installation](#verify-the-installation)
 - [Connecting from Drupal](#connecting-from-drupal)
 - [Operations](#operations)
+- [Embedding models for vector search](#embedding-models-for-vector-search)
 - [Configuration helper reference](#configuration-helper-reference)
 - [Troubleshooting](#troubleshooting)
 - [License](#license)
@@ -1090,6 +1091,93 @@ docker run --rm \
     sh -c "rm -rf /data/* && tar xzf /backup/manticore-data-YYYY-MM-DD.tar.gz -C /data"
 docker compose --profile public up -d
 ```
+
+
+## Embedding models for vector search
+
+Manticore can generate text embeddings itself for vector (semantic /
+more-like-this) search, used by the
+[Search API Manticore](https://www.drupal.org/project/search_api_manticore)
+Drupal module. The first time a table that names an embedding model is
+created, the engine downloads that model from the internet and caches it
+inside its data volume, under `/var/lib/manticore/.cache`. On a normal
+internet-connected host this is automatic and needs no preparation.
+
+Two situations need manual steps: a host with no outbound internet, and a
+container started with no network at all.
+
+### Pre-populate the model cache (air-gapped host)
+
+A Manticore host with no outbound internet cannot download a model on
+demand — the `CREATE TABLE` that names it fails with
+`Failed to download model configuration`. Supply the cache pre-baked
+instead: warm it once on a machine that does have internet, then copy it
+into this host's data volume **before** the first table is created.
+
+The model cache lives in the named volume `manticore-docker_manticore-data`
+(mounted at `/var/lib/manticore` in the container), under `.cache`. On the
+host it resolves to:
+
+```bash
+docker volume inspect manticore-docker_manticore-data --format '{{ .Mountpoint }}'
+# e.g. /var/lib/docker/volumes/manticore-docker_manticore-data/_data
+# the cache is the .cache subdirectory of that path
+```
+
+1. On an internet-connected machine running the same image, create a
+   throwaway table that names the model you intend to use, so the engine
+   downloads it. For example `sentence-transformers/all-MiniLM-L6-v2`
+   (~88 MB) or `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`.
+2. Archive the warmed cache from that machine's volume:
+
+   ```bash
+   docker run --rm \
+       -v manticore-docker_manticore-data:/data \
+       -v "$(pwd)":/backup \
+       alpine \
+       tar czf /backup/manticore-cache.tar.gz -C /data .cache
+   ```
+
+3. Transfer `manticore-cache.tar.gz` to the air-gapped host and unpack it
+   into that host's volume **before the first vector table is created**
+   (with the stack stopped):
+
+   ```bash
+   docker compose down            # or: docker compose --profile public down
+   docker run --rm \
+       -v manticore-docker_manticore-data:/data \
+       -v "$(pwd)":/backup \
+       alpine \
+       tar xzf /backup/manticore-cache.tar.gz -C /data
+   docker compose up -d           # or: --profile public up -d
+   ```
+
+With the cache present, creating a table that names that model succeeds
+offline and KNN queries work, because the engine finds the model locally
+instead of trying to download it.
+
+### Starting with no network (`--network none`)
+
+The stock Manticore image does not start under `--network none`. Its
+entrypoint derives the replication listen address from `hostname -I`,
+which returns an empty string when there is no network interface; the
+empty value produces an invalid `port 0` replication listen spec and
+`searchd` refuses to start.
+
+This stack does not use `--network none` (Manticore always has at least the
+internal Docker network), so it is unaffected. If you nonetheless need a
+fully network-isolated container, override the listen specification to drop
+the replication listeners. The official image maps any `searchd_<name>`
+environment variable to the corresponding `searchd` setting, so set
+`searchd_listen` to an explicit non-replication spec, for example:
+
+```yaml
+    environment:
+      searchd_listen: "9308:http"
+```
+
+Replication is only needed for multi-node clusters; a single isolated node
+does not use it.
 
 
 ## Configuration helper reference
