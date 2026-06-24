@@ -322,7 +322,7 @@ Now choose your scenario:
 docker compose up -d
 ```
 
-On the first run Docker downloads the `manticoresearch/manticore:25.0.0`
+On the first run Docker downloads the `manticoresearch/manticore:27.1.5`
 image from Docker Hub (~200 MB) and creates the container in detached
 (background) mode. Expected output:
 
@@ -341,7 +341,7 @@ docker compose ps
 
 ```
 NAME        IMAGE                              STATUS                  PORTS
-manticore   manticoresearch/manticore:25.0.0   Up X seconds (healthy)  127.0.0.1:9306->9306/tcp, 127.0.0.1:9308->9308/tcp, 9312/tcp
+manticore   manticoresearch/manticore:27.1.5   Up X seconds (healthy)  127.0.0.1:9306->9306/tcp, 127.0.0.1:9308->9308/tcp, 9312/tcp
 ```
 
 Note that ports `9306` and `9308` are bound to `127.0.0.1` only — they are
