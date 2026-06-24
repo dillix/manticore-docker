@@ -734,12 +734,12 @@ curl -s http://127.0.0.1:9308/cli -d 'SHOW VERSION'
 +------------+-----------------------------------+
 | Component  | Version                           |
 +------------+-----------------------------------+
-| Daemon     | 25.0.0 ce3c27828@26032712         |
-| Columnar   | columnar 13.0.0 e60b083@26032708  |
-| Secondary  | secondary 13.0.0 e60b083@26032708 |
-| Knn        | knn 13.0.0 e60b083@26032708       |
-| Embeddings | embeddings 1.1.1 e60b083@26032708 |
-| Buddy      | buddy v3.44.1+26031916-d0ff5bfe   |
+| Daemon     | 27.1.5 5a1cf9399@26061911         |
+| Columnar   | columnar 13.6.1 94c1040@26061507  |
+| Secondary  | secondary 13.6.1 94c1040@26061507 |
+| Knn        | knn 13.6.1 94c1040@26061507       |
+| Embeddings | embeddings 1.1.1 94c1040@26061507 |
+| Buddy      | buddy v4.0.1+26061913-64a3819f    |
 +------------+-----------------------------------+
 ```
 
@@ -864,7 +864,7 @@ curl -s -u 'drupal:your-password' https://search.example.com/cli -d 'SHOW STATUS
 +-------------------------------+------------------------------------------------------------+
 | uptime                        | 86                                                         |
 | connections                   | 9                                                          |
-| version                       | 25.0.0 ce3c27828@26032712 (columnar 13.0.0 ...)            |
+| version                       | 27.1.5 5a1cf9399@26061911 (columnar 13.6.1 ...)            |
 ...
 ```
 

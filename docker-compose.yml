@@ -105,7 +105,7 @@ services:
   #   ./config password change         # interactive — never accepts the
   #                                    # password as a CLI argument
   config:
-    image: caddy:2-alpine
+    image: caddy:2.11.4-alpine
     profiles: ["tools"]
     environment:
       HOST_UID: ${HOST_UID:-1000}
@@ -116,7 +116,7 @@ services:
     entrypoint: ["/bin/sh", "/work/bin/config.sh"]
 
   caddy:
-    image: caddy:2-alpine
+    image: caddy:2.11.4-alpine
     container_name: manticore-caddy
     restart: unless-stopped
     profiles: ["public"]
