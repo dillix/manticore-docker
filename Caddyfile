@@ -1,5 +1,5 @@
-# Caddyfile — reverse proxy with automatic HTTPS and HTTP Basic Auth
-# in front of Manticore Search.
+# Caddyfile — reverse proxy with automatic HTTPS in front of Manticore
+# Search.
 #
 # All values come from environment variables defined in the .env file
 # and exposed by docker-compose.yml; do not hardcode anything here.
@@ -13,15 +13,13 @@
 {$MANTICORE_DOMAIN} {
 	tls {$MANTICORE_ACME_EMAIL}
 
-	# HTTP Basic Authentication. Username is in plaintext; the password
-	# is a bcrypt hash (generated with `caddy hash-password`).
-	# Manticore has no authentication of its own — this is the only
-	# barrier between the public internet and the search daemon.
-	basic_auth {
-		{$MANTICORE_USERNAME} {$MANTICORE_PASSWORD_HASH}
-	}
-
-	# Forward all authenticated requests to Manticore's HTTP API.
+	# Authentication is enforced by the Manticore engine itself (users,
+	# passwords and bearer tokens — see `searchd_auth` in
+	# docker-compose.yml), so this proxy holds no credentials and checks
+	# none. It terminates TLS and forwards the Authorization header
+	# through untouched, which is what lets the Drupal module
+	# authenticate with HTTP Basic straight to the daemon.
+	#
 	# `manticore` is the service name from docker-compose.yml; Docker's
 	# embedded DNS resolves it to the container's internal IP.
 	reverse_proxy manticore:9308

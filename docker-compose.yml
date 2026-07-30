@@ -7,8 +7,12 @@
 #     docker compose up -d
 #
 #   Scenario B (dedicated Manticore VPS with bundled Caddy reverse proxy
-#               providing TLS + Basic Auth automatically):
+#               providing TLS automatically):
 #     docker compose --profile public up -d
+#
+# Authentication is enforced by the Manticore engine itself in both
+# scenarios — see `searchd_auth` below. Run `./config setup` after the
+# first `up -d` to create the admin and the application user.
 #
 # Configuration is in the .env file; copy .env.example to .env first.
 
@@ -29,11 +33,21 @@ services:
     # (https://www.drupal.org/project/search_api_manticore) for its
     # negation features. The option only relaxes a parser constraint;
     # it has no performance impact when the feature isn't used.
+    #
+    # searchd_auth=1 turns on Manticore's built-in authentication, which
+    # maps to `auth = 1` in the generated config. Every request on both
+    # the HTTP and MySQL protocols then needs credentials: a username and
+    # password (HTTP Basic or MySQL) or a bearer token. Until an admin is
+    # bootstrapped the daemon answers everything with 401 — tables load
+    # and are intact, they are simply inaccessible. `./config setup`
+    # bootstraps the admin and creates the application user.
     environment:
       searchd_not_terms_only_allowed: 1
+      searchd_auth: 1
 
-    # Bind ports to 127.0.0.1 only — Manticore has no built-in
-    # authentication, so it must never be exposed directly.
+    # Bind ports to 127.0.0.1 only. The engine authenticates natively, so
+    # this is defence in depth rather than the only barrier — but it keeps
+    # the daemon off the public internet, which is worth having anyway.
     # In Scenario B, Caddy (in the same Docker network) reaches it
     # via the internal hostname `manticore`, no host port needed.
     # In Scenario A, the local Drupal site reaches it via 127.0.0.1.
@@ -73,9 +87,25 @@ services:
     healthcheck:
       # Probe the HTTP API on port 9308 (the same one Drupal will use).
       # The manticoresearch/manticore image ships with wget but NOT curl.
-      # We hit the /cli endpoint with SHOW STATUS and discard the body;
-      # wget returns a non-zero exit code on connection failure or 4xx/5xx.
-      test: ["CMD-SHELL", "wget -q --post-data='SHOW STATUS' -O /dev/null http://127.0.0.1:9308/cli || exit 1"]
+      #
+      # An anonymous probe is DELIBERATE, and so is accepting wget exit 6.
+      # With auth on, every endpoint answers an unauthenticated request with
+      # HTTP 401, and wget exits 6 on 401 — which still proves the daemon is
+      # alive and serving. Do NOT "tighten" this to exit 0 only: between
+      # `up -d` and the operator finishing `./config setup` there is no admin
+      # yet, so 401 is the only answer the daemon can give. Marking the
+      # container unhealthy in that window makes `depends_on:
+      # condition: service_healthy` below block Caddy from ever starting,
+      # which wedges the whole stack on every fresh install.
+      #
+      # A dead daemon still fails correctly: wget exits 4 when nothing is
+      # listening and 8 on a server error, neither of which is accepted.
+      #
+      # The endpoint is /sql?mode=raw rather than /cli because /cli is
+      # served through Buddy while /sql is served by searchd directly. A
+      # slow Buddy start could otherwise flap this probe, and it needs
+      # nothing Buddy provides.
+      test: ["CMD-SHELL", "wget -q --post-data='SHOW STATUS' -O /dev/null 'http://127.0.0.1:9308/sql?mode=raw'; ec=$$?; [ $$ec -eq 0 ] || [ $$ec -eq 6 ]"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -85,27 +115,35 @@ services:
       - manticore
 
   # Configuration helper: a single entrypoint with subcommands for
-  # managing .env (domain, email, username, password) and running the
-  # interactive setup wizard. The shell logic lives in bin/config.sh,
-  # which is mounted read-only and executed via `sh /work/bin/config.sh`
-  # — no executable bit (+x) on the host is required.
+  # managing .env and the engine's own users, tokens and grants. The shell
+  # logic lives in bin/config.sh, which is executed via
+  # `sh /work/bin/config.sh` — no executable bit (+x) on the host required.
+  #
+  # The image is the same pinned Manticore tag as the daemon, so it is
+  # already present on any host running this stack and ships everything
+  # the script needs: GNU wget (not busybox — `--header` works), sed, awk
+  # and base64. It joins the `manticore` network so it can reach the
+  # daemon by service name.
   #
   # Runs on demand only (profile=tools) — never started by `up -d`.
   #
-  # Usage (recommended — through the host-side wrapper):
+  # Always invoke it through the host-side wrapper, which does the parts
+  # that cannot be done from inside a container (the admin bootstrap):
   #   ./config <subcommand> [args...]
   #
   # Examples:
-  #   ./config show
-  #   ./config setup
+  #   ./config setup                   # first-time wizard
+  #   ./config show                    # .env plus the engine's users
+  #   ./config check                   # authenticated query against the engine
   #   ./config domain search.example.com
   #   ./config email admin@example.com
   #   ./config username drupal
-  #   ./config password generate
   #   ./config password change         # interactive — never accepts the
   #                                    # password as a CLI argument
+  #   ./config token rotate            # new MANTICORE_ADMIN_TOKEN
+  #   ./config admin reset             # destructive recovery
   config:
-    image: caddy:2.11.4-alpine
+    image: manticoresearch/manticore:27.1.5
     profiles: ["tools"]
     environment:
       HOST_UID: ${HOST_UID:-1000}
@@ -114,6 +152,8 @@ services:
       - .:/work
     working_dir: /work
     entrypoint: ["/bin/sh", "/work/bin/config.sh"]
+    networks:
+      - manticore
 
   caddy:
     image: caddy:2.11.4-alpine
@@ -125,11 +165,12 @@ services:
       - "80:80"
       - "443:443"
 
+    # Only the two TLS values. Caddy no longer authenticates anything, so
+    # it is deliberately given no credentials at all — the engine checks
+    # them, and Caddy just forwards the Authorization header.
     environment:
       MANTICORE_DOMAIN: ${MANTICORE_DOMAIN:-}
       MANTICORE_ACME_EMAIL: ${MANTICORE_ACME_EMAIL:-}
-      MANTICORE_USERNAME: ${MANTICORE_USERNAME:-}
-      MANTICORE_PASSWORD_HASH: ${MANTICORE_PASSWORD_HASH:-}
 
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro

@@ -2,20 +2,33 @@
 # =============================================================================
 # Manticore Search Docker Stack — configuration helper
 # =============================================================================
-# This script runs inside the `config` service container (caddy:2-alpine).
-# It manipulates the .env file via a single entrypoint with subcommands.
+# This script runs inside the `config` service container, which uses the same
+# pinned image as the daemon (manticoresearch/manticore:27.1.5). That image
+# ships GNU wget, sed, awk and base64 — but no curl and no jq — so everything
+# here speaks to the engine over HTTP with wget and parses JSON with sed.
 #
-# Invocation (always via Compose, never directly):
-#   docker compose run --rm -it config <subcommand> [args...]
+# It manages two things:
+#   - the .env file (domain, ACME email, application username, admin token);
+#   - the engine's own users, passwords, bearer tokens and grants.
+#
+# Manticore 27.1.5 authenticates natively on both the HTTP and MySQL
+# protocols. The reverse proxy authenticates nothing.
+#
+# Invocation (always through the host-side wrapper, never directly):
+#   ./config <subcommand> [args...]
 #
 # Subcommands:
-#   show                          Display current .env (password hash masked)
-#   setup                         Interactive wizard for first-time config
-#   password generate             Generate a random password, hash, write
-#   password change               Prompt for password interactively, hash, write
-#   domain <fqdn>                 Set MANTICORE_DOMAIN
-#   email <addr>                  Set MANTICORE_ACME_EMAIL
-#   username <name>               Set MANTICORE_USERNAME
+#   setup                Interactive wizard (host wrapper drives two phases)
+#   show                 .env plus the engine's users and grants
+#   check                Authenticated query — proves the engine executes SQL
+#   domain <fqdn>        Set MANTICORE_DOMAIN
+#   email <addr>         Set MANTICORE_ACME_EMAIL
+#   username <name>      Set MANTICORE_USERNAME and create the user
+#   password change      New password for the application user
+#   token rotate         New MANTICORE_ADMIN_TOKEN
+#
+# `admin reset` lives entirely in the host wrapper: it needs a local searchd
+# CLI call that cannot be made over the network.
 #
 # The script does NOT need executable bit (+x) — it is run as
 #   /bin/sh /work/bin/config.sh ...
@@ -43,10 +56,56 @@ HOST_GID="${HOST_GID:-1000}"
 # to showing both branches in setup next-steps.
 CADDY_RUNNING="${CADDY_RUNNING:-unknown}"
 
+# Set to 1 by the host-side wrapper. Some phases depend on work only the
+# wrapper can do, and refuse to run without it.
+CONFIG_WRAPPER="${CONFIG_WRAPPER:-0}"
+
+# The engine. The config service joins the `manticore` compose network, so
+# the daemon is reachable by service name.
+MC_HOST="manticore"
+MC_PORT="9308"
+MC_SQL_PATH="/sql?mode=raw"
+MC_SQL_URL="http://${MC_HOST}:${MC_PORT}${MC_SQL_PATH}"
+
+# The admin account the bootstrap creates. The engine has no way to rename a
+# user, so this is fixed; the host wrapper uses the same name.
+ADMIN_USER="admin"
+
+# Exactly what the search_api_manticore module needs, and nothing more.
+# Measured, one grant at a time, against the endpoints the module actually
+# calls:
+#   read   — POST /search, and every DESCRIBE / SHOW CREATE TABLE
+#   write  — POST /bulk (indexing), POST /delete, TRUNCATE
+#   schema — CREATE/DROP/ALTER TABLE, and SHOW STATUS
+# `schema` is NOT optional for a search-only site: SHOW STATUS is the
+# module's availability probe, so without it the module reports the backend
+# as down even though search and indexing work perfectly.
+# `admin` and `replication` are never granted.
+APP_GRANTS="read write schema"
+
 # Validation regex patterns (POSIX BRE/ERE).
 DOMAIN_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
 EMAIL_RE='^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'
+# 1-32 characters from [A-Za-z0-9_-]. Do NOT loosen this without measuring:
+# a `'` breaks CREATE USER outright, and a `:` produces a user that is
+# created successfully and then fails authentication forever, because the
+# colon is HTTP Basic's separator between username and password. This set
+# excludes both.
 USERNAME_RE='^[A-Za-z0-9_-]{1,32}$'
+
+# Authorization header used by every engine call. Set by mc_auth_admin (the
+# admin bearer token from .env) or mc_auth_basic (a username and password,
+# which is how the Drupal module authenticates).
+MC_AUTH_HEADER=""
+
+# Response body of the last mc_post call, for error reporting.
+MC_LAST_BODY=""
+
+# Operator-visible engine users, newline-separated, loaded by mc_load_users.
+# An engine can legitimately have an empty list, so emptiness cannot double
+# as "not loaded yet" — hence the separate flag.
+MC_USERS=""
+MC_USERS_LOADED=no
 
 # -----------------------------------------------------------------------------
 # Output helpers (with terminal-aware coloring)
@@ -99,16 +158,15 @@ get_env_var() {
 
 # Set or replace a variable in .env. Idempotent.
 #   Usage: set_env_var MANTICORE_DOMAIN search.example.com
-# Uses a custom sed delimiter (|) because bcrypt hashes contain '/' but
-# never '|'. The value is passed through unchanged — caller is responsible
-# for any required escaping (e.g. doubling $ for Compose interpolation).
+# Uses a custom sed delimiter (|) because none of the values written here can
+# contain one, while '/' appears in ordinary values like email addresses.
+# The value is passed through unchanged; ampersands and backslashes are
+# escaped below because sed treats them specially in a replacement.
 set_env_var() {
     local key="$1"
     local value="$2"
     ensure_env_file
     if grep -q "^${key}=" "$ENV_FILE"; then
-        # Replace existing line. Escape ampersands and backslashes that are
-        # special to sed's replacement; the | delimiter handles slashes.
         local esc
         esc=$(printf '%s\n' "$value" | sed 's/[&\\]/\\&/g')
         sed -i "s|^${key}=.*|${key}=${esc}|" "$ENV_FILE"
@@ -117,15 +175,31 @@ set_env_var() {
     fi
 }
 
-# Restore ownership of .env to the host user.
+# Remove a variable's line from .env. Any comment block above it is left
+# alone — .env.example is the documented copy, and an operator's own notes
+# are not ours to delete.
+del_env_var() {
+    local key="$1"
+    [ -f "$ENV_FILE" ] || return 0
+    grep -q "^${key}=" "$ENV_FILE" || return 0
+    sed -i "/^${key}=/d" "$ENV_FILE"
+}
+
+# Restore ownership of .env to the host user, and keep it private: it holds
+# the admin token, which is a root-equivalent credential for the engine.
+# A .env freshly copied from .env.example would otherwise inherit that
+# file's mode.
 restore_env_ownership() {
     [ -f "$ENV_FILE" ] || return 0
     chown "${HOST_UID}:${HOST_GID}" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
 }
 
 # Print a reminder that running Caddy needs to be recreated to pick up
-# changes to environment-substituted values (username, password hash, etc).
-# Call this after a successful set_env_var on any auth-related field.
+# changes to environment-substituted values.
+#
+# Only MANTICORE_DOMAIN and MANTICORE_ACME_EMAIL reach Caddy — it holds no
+# credentials any more — so only those two commands call this.
 #
 # The behaviour depends on CADDY_RUNNING (set by the ./config wrapper):
 #   - "yes":     stay silent. The wrapper will recreate Caddy silently
@@ -191,15 +265,11 @@ confirm() {
     esac
 }
 
-# Mask a bcrypt hash for display: show prefix and length, hide body.
-mask_hash() {
-    local hash="$1"
-    [ -z "$hash" ] && { printf '(not set)'; return; }
-    # Bcrypt hashes look like $2a$14$XXXXXXXX... or, in our .env, $$2a$$14$$XX...
-    # Either way, show the first 10 chars and replace the rest with ••••••••
-    local prefix
-    prefix=$(printf '%s' "$hash" | cut -c1-10)
-    printf '%s••••••••' "$prefix"
+# Mask a bearer token for display: enough to recognise, not enough to use.
+mask_token() {
+    local token="$1"
+    [ -z "$token" ] && { printf '(not set)'; return; }
+    printf '%s...' "$(printf '%s' "$token" | cut -c1-6)"
 }
 
 # -----------------------------------------------------------------------------
@@ -230,17 +300,433 @@ validate_username() {
 #   - URL-safe (no percent-encoding needed if the password ever lands in
 #     a connection string)
 #   - regex- and JSON-neutral
+#
+# It is also safe for the engine, which is now the part that matters, and
+# that is measured rather than assumed:
+#   - `'` and `\` are the ONLY two characters that break CREATE USER (both
+#     produce a SQL syntax error). Neither is in this set.
+#   - the engine's minimum password length is 8; 24 clears it comfortably.
+#   - a `:` would be harmless in a password (HTTP Basic splits on the first
+#     one) but fatal in a username, and this set excludes it either way.
+# Do not widen the alphabet without re-measuring those three facts.
 generate_password() {
     tr -dc 'A-Za-z0-9_.-' </dev/urandom | head -c 24
 }
 
-# Hash a plaintext password with bcrypt, then double every '$' so the value
-# survives Compose interpolation when read from .env.
-hash_password_for_env() {
-    local plaintext="$1"
-    local raw_hash
-    raw_hash=$(caddy hash-password --plaintext "$plaintext")
-    printf '%s' "$raw_hash" | sed 's/\$/$$/g'
+# Guard against an empty generated password. Without this, an empty value
+# reaches the daemon and comes back as "password must be at least 8
+# characters", which sends the operator looking in the wrong place.
+require_password() {
+    [ -n "${1:-}" ] && return 0
+    err "Password generation failed (empty value from /dev/urandom)."
+    return 1
+}
+
+# -----------------------------------------------------------------------------
+# Engine helpers
+# -----------------------------------------------------------------------------
+
+# Authenticate as the admin, with the bearer token from .env.
+mc_auth_admin() {
+    local token
+    token=$(get_env_var MANTICORE_ADMIN_TOKEN 2>/dev/null || true)
+    if [ -z "$token" ]; then
+        err "No MANTICORE_ADMIN_TOKEN in $ENV_FILE."
+        echo "" >&2
+        echo "The engine needs an admin credential before it can be managed." >&2
+        echo "Run the setup wizard:" >&2
+        echo "  ./config setup" >&2
+        return 1
+    fi
+    MC_AUTH_HEADER="Authorization: Bearer ${token}"
+}
+
+# Authenticate as an ordinary user with a password — the same way the Drupal
+# module does. base64 without -w0, which is a GNU coreutils extension: the
+# encoded value here is far too short to wrap, but `tr -d` costs nothing and
+# does not care which base64 is installed.
+mc_auth_basic() {
+    local credentials
+    credentials=$(printf '%s:%s' "$1" "$2" | base64 | tr -d '\n')
+    MC_AUTH_HEADER="Authorization: Basic ${credentials}"
+}
+
+# Explain a failed engine call, using the daemon's own words wherever it
+# gives us any.
+mc_report_failure() {
+    local _ec="$1"
+    local _body="$2"
+    local _msg
+    _msg=$(printf '%s' "$_body" | tr -d '\n' |
+        sed -n 's/.*"error":"\([^"]*\)".*/\1/p')
+
+    # The daemon's own words lead, because they are the useful part. The
+    # wget exit code rides along in brackets rather than on a line of its
+    # own: it is what separates 401 (6) from 403 (8) from "nothing is
+    # listening" (4), so it must stay recoverable — but a whole extra line
+    # of it, on every failure, would bury the message that matters.
+    [ -n "$_msg" ] && err "manticore: $_msg [wget $_ec]"
+
+    # Below, only what the body did not already say. The 4 and 6 branches
+    # name their condition outright, so they do not repeat the code.
+    case "$_ec" in
+        0) [ -n "$_msg" ] || err "manticore: unexpected response from the daemon [wget 0]." ;;
+        4) err "manticore: cannot reach the daemon at ${MC_HOST}:${MC_PORT} — is the stack running?" ;;
+        6)
+            # Deliberately does not name a cause. HTTP 401 here means the
+            # daemon refused the request, and it uses the same status and an
+            # authentication-shaped message both when a credential is wrong
+            # and when a statement is one this user may not run at all
+            # (SET PASSWORD ... FOR is the known example). Note that a 401
+            # carries no response body, even with --content-on-error, so
+            # there is nothing else to report.
+            err "manticore: the daemon rejected this request (HTTP 401)."
+            ;;
+        *) [ -n "$_msg" ] || err "manticore: request failed [wget $_ec]." ;;
+    esac
+}
+
+# Run a statement over /sql?mode=raw. Prints the response body on success;
+# on failure explains why and returns 1.
+#
+# --content-on-error is MANDATORY. GNU wget throws the response body away on
+# any non-2xx, and Manticore reports SQL errors as HTTP 500 — so without it a
+# failing statement yields zero bytes and the operator learns nothing.
+#
+# Detection combines wget's exit code with a test for an empty "error"
+# field, because failures arrive in two different shapes: HTTP-level
+# {"error":"..."} and SQL-level [{...,"error":"...","warning":""}] returned
+# with HTTP 200.
+mc_sql() {
+    local _body _ec
+    if [ -z "$MC_AUTH_HEADER" ]; then
+        err "Internal error: mc_sql called before authentication was set up."
+        return 1
+    fi
+    _ec=0
+    # `|| _ec=$?` rather than a bare assignment: `set -e` would otherwise
+    # abort the script on the very failures this function exists to report.
+    _body=$(wget -q --content-on-error -O - \
+                 --header="$MC_AUTH_HEADER" \
+                 --post-data="$1" "$MC_SQL_URL" 2>/dev/null) || _ec=$?
+    if [ "$_ec" -ne 0 ] || ! printf '%s' "$_body" | tr -d '\n' | grep -q '"error":""'; then
+        mc_report_failure "$_ec" "$_body"
+        return 1
+    fi
+    printf '%s' "$_body"
+}
+
+# POST to an arbitrary endpoint with the current credential. Stores the body
+# in MC_LAST_BODY and returns wget's exit code, so callers can tell 401
+# (exit 6) from 403 (exit 8).
+#
+# Separate from mc_sql on purpose: mc_sql's success test is SQL-shaped and
+# only meaningful on /sql?mode=raw.
+#   Usage: mc_post <path> <body> [content-type]
+mc_post() {
+    local _path="$1"
+    local _body="$2"
+    local _ctype="${3:-}"
+    local _ec=0
+    if [ -n "$_ctype" ]; then
+        MC_LAST_BODY=$(wget -q --content-on-error -O - \
+            --header="$MC_AUTH_HEADER" \
+            --header="Content-Type: $_ctype" \
+            --post-data="$_body" \
+            "http://${MC_HOST}:${MC_PORT}${_path}" 2>/dev/null) || _ec=$?
+    else
+        MC_LAST_BODY=$(wget -q --content-on-error -O - \
+            --header="$MC_AUTH_HEADER" \
+            --post-data="$_body" \
+            "http://${MC_HOST}:${MC_PORT}${_path}" 2>/dev/null) || _ec=$?
+    fi
+    return "$_ec"
+}
+
+# Run a statement and extract the raw bearer token it returns.
+#
+# The same extraction lives in the host wrapper's mint_admin_token(), which
+# cannot source this file — keep the two in step.
+#
+# Three details matter:
+#   - Isolate the "data" array first, so a greedy match cannot run across
+#     rows.
+#   - Anchor on `"token":"` INCLUDING the quote. The response also carries a
+#     schema block containing {"token":{"type":"string"}}, and a brace
+#     instead of a quote is what keeps the pattern off it.
+#   - Match by NAME, never by position: CREATE USER returns
+#     (token, username, generated_at) while TOKEN returns (username, token).
+mc_token() {
+    local _r _t
+    _r=$(mc_sql "$1") || return 1
+    _t=$(printf '%s' "$_r" | tr -d '\n' |
+         sed 's/.*"data":\[//; s/\].*//' |
+         sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+    # Not paranoia: SHOW TOKEN FOR a nonexistent user answers HTTP 200 with
+    # an empty data array and no error at all, which passes every other
+    # test here. Without this check that would be written out as a valid
+    # empty credential.
+    if [ -z "$_t" ]; then
+        err "manticore: no token in the response."
+        return 1
+    fi
+    printf '%s' "$_t"
+}
+
+# Issue (mint or rotate) a bearer token for one named user.
+#
+# This is the ONLY place a TOKEN statement is built, and it is a function
+# rather than an inline statement for one reason: `TOKEN` with no username
+# does not fail, it rotates the credential of whatever identity the
+# connection is authenticated as. Over the /cli endpoint that identity is
+# the engine's internal `system.buddy` account, and rotating it breaks Buddy
+# permanently — no restart, re-mint or repair recovers it; the data volume
+# has to be destroyed. So: never build this statement by concatenation
+# elsewhere, and never let the username be empty or internal.
+mc_issue_token() {
+    local user="${1:-}"
+    if [ -z "$user" ]; then
+        err "Refusing to issue a token without a username."
+        err "A bare TOKEN statement would rotate the credential of the"
+        err "connection's own identity, which can permanently break the"
+        err "engine's internal Buddy account."
+        return 1
+    fi
+    case "$user" in
+        system.*)
+            err "Refusing to issue a token for the internal user '$user'."
+            err "Rotating an internal credential permanently breaks it."
+            return 1
+            ;;
+    esac
+    mc_token "TOKEN '$user'"
+}
+
+# Split the `data` array of a /sql?mode=raw response into one JSON row per
+# line, so the row patterns below cannot match across rows.
+mc_rows() {
+    tr -d '\n' | sed 's/.*"data":\[//; s/\].*//; s/},{/}\
+{/g'
+}
+
+# Operator-visible users, one per line.
+#
+# SHOW USERS returns a single `username` column — no type, no flag, no
+# created-at. The `system.` name prefix is therefore the ONLY way to tell an
+# internal account from one an operator made, which is why every list here
+# filters it out: the script must never offer to drop, grant on, or re-token
+# an internal user.
+mc_user_list() {
+    local body
+    body=$(mc_sql 'SHOW USERS') || return 1
+    printf '%s' "$body" | mc_rows |
+        sed -n 's/.*"username":"\([^"]*\)".*/\1/p' |
+        awk '$0 !~ /^system\./'
+}
+
+# Read the user list once, into MC_USERS, and fail loudly if the engine
+# cannot be asked.
+#
+# mc_user_exists deliberately does NOT call the engine itself: as a pipeline
+# ending in grep it would report a stopped daemon or a rejected token as
+# "that user does not exist", and the caller would go on to offer to create
+# a user that is already there. Every caller loads the list first, so a
+# failure to reach the engine surfaces as a failure.
+mc_load_users() {
+    MC_USERS=$(mc_user_list) || return 1
+    MC_USERS_LOADED=yes
+}
+
+# Answers only from a list that was actually loaded. Returning "no such
+# user" for an unloaded list would put the silent wrong answer back, one
+# level up: the caller would go on to create a user that already exists. An
+# empty list IS a valid answer, so the flag is what distinguishes the two.
+mc_user_exists() {
+    if [ "$MC_USERS_LOADED" != "yes" ]; then
+        err "Internal error: mc_user_exists called before mc_load_users."
+        exit 70
+    fi
+    printf '%s\n' "$MC_USERS" | grep -qx "$1"
+}
+
+# Grants, as "username action target" lines, internal users filtered.
+mc_permissions() {
+    local body
+    body=$(mc_sql 'SHOW PERMISSIONS') || return 1
+    printf '%s' "$body" | mc_rows |
+        sed -n 's/.*"username":"\([^"]*\)".*"action":"\([^"]*\)".*"target":"\([^"]*\)".*/\1 \2 \3/p' |
+        awk '$1 !~ /^system\./'
+}
+
+# Grant the application grants that are missing, and only those.
+#
+# Issuing them unconditionally would mean relying on a duplicate GRANT being
+# harmless, which has not been established. Reading the current state first
+# avoids the question entirely. This script never issues REVOKE, so a
+# permission row's presence means the grant is in force.
+mc_ensure_grants() {
+    local user="$1"
+    local perms action
+    perms=$(mc_permissions) || return 1
+    for action in $APP_GRANTS; do
+        if printf '%s\n' "$perms" |
+                awk -v u="$user" -v a="$action" \
+                    '$1 == u && $2 == a && $3 == "*" { found = 1 }
+                     END { exit !found }'; then
+            info "  grant $action: already present"
+        else
+            mc_sql "GRANT $action ON * TO '$user'" >/dev/null || return 1
+            ok "  grant $action: granted"
+        fi
+    done
+}
+
+# Create the application user with the given password.
+#
+# CREATE USER also mints a bearer token for the new user and returns it,
+# whether or not anyone asked for one — so the user HAS a token from the
+# moment it exists. We deliberately discard it: the Drupal module can only
+# authenticate with a username and password today, and an unused credential
+# is one more thing that could leak. It is not that no token was issued.
+mc_create_user() {
+    local user="$1"
+    local password="$2"
+    mc_sql "CREATE USER '$user' IDENTIFIED BY '$password'" >/dev/null || return 1
+}
+
+mc_set_password() {
+    local user="$1"
+    local password="$2"
+    mc_sql "SET PASSWORD '$password' FOR '$user'" >/dev/null || return 1
+}
+
+# Report one application-credential probe, naming the grant it exercises.
+#   Usage: app_probe <label> <grant> <path> <body> [content-type]
+app_probe() {
+    local label="$1"
+    local grant="$2"
+    local _ec=0
+    shift 2
+    mc_post "$@" || _ec=$?
+
+    if [ "$_ec" -eq 0 ]; then
+        ok "  $label: OK (grant '$grant')"
+        return 0
+    fi
+
+    err "  $label: FAILED (grant '$grant')"
+    local _msg
+    _msg=$(printf '%s' "$MC_LAST_BODY" | tr -d '\n' |
+        sed -n 's/.*"error":"\([^"]*\)".*/\1/p')
+    [ -n "$_msg" ] && err "    manticore: $_msg"
+    case "$_ec" in
+        # Measured: wget exits 6 on 401 and 8 on 403, which is exactly the
+        # difference between "this credential was refused" and "this
+        # credential is fine but lacks the grant".
+        6) err "    HTTP 401 — the daemon did not accept this username and password." ;;
+        8) err "    HTTP 403 — authenticated, but the '$grant' grant is missing." ;;
+        4) err "    Cannot reach the daemon at ${MC_HOST}:${MC_PORT}." ;;
+        *) err "    wget exit $_ec." ;;
+    esac
+    return 1
+}
+
+# Verify the credential the operator is about to paste into Drupal.
+#
+# The admin `check` only proves that the engine answers THIS SCRIPT. It says
+# nothing about the application user, so while its password is still in hand
+# we use it: authenticate over HTTP Basic — the module's own transport — and
+# exercise all three grants, against a scratch table created and dropped
+# here so nothing is left behind.
+#
+# Requires the admin credential to be the current one on entry, and restores
+# it before returning.
+#
+# The restore and the scratch-table drop both live in mc_verify_cleanup, and
+# every exit from this function goes through it — including Ctrl-C, via the
+# trap. Leaving that to a single tail-end block would mean any early return
+# added later silently left the script authenticated as the application user
+# and a cfgcheck_* table behind in the operator's index list.
+MC_VERIFY_ADMIN_HEADER=""
+MC_VERIFY_TABLE=""
+
+mc_verify_cleanup() {
+    if [ -n "$MC_VERIFY_ADMIN_HEADER" ]; then
+        MC_AUTH_HEADER="$MC_VERIFY_ADMIN_HEADER"
+        MC_VERIFY_ADMIN_HEADER=""
+    fi
+    if [ -n "$MC_VERIFY_TABLE" ]; then
+        mc_sql "DROP TABLE IF EXISTS $MC_VERIFY_TABLE" >/dev/null 2>&1 ||
+            warn "Could not drop the scratch table '$MC_VERIFY_TABLE'."
+        MC_VERIFY_TABLE=""
+    fi
+}
+
+mc_verify_app() {
+    local user="$1"
+    local password="$2"
+    local failures=0
+
+    MC_VERIFY_ADMIN_HEADER="$MC_AUTH_HEADER"
+    MC_VERIFY_TABLE="cfgcheck_$(tr -dc 'a-z0-9' </dev/urandom | head -c 8)"
+    trap 'mc_verify_cleanup; trap - INT TERM HUP; exit 130' INT TERM HUP
+
+    info "Verifying the application credential ($user) over HTTP Basic..."
+
+    if ! mc_sql "CREATE TABLE $MC_VERIFY_TABLE (title text)" >/dev/null; then
+        warn "Could not create a scratch table; skipping the credential check."
+        # Nothing to drop — creation is what failed.
+        MC_VERIFY_TABLE=""
+        mc_verify_cleanup
+        trap - INT TERM HUP
+        return 1
+    fi
+
+    mc_auth_basic "$user" "$password"
+
+    # Indexing first, so the read probe has something to find. The module
+    # indexes through /bulk with `replace` operations; the trailing newline
+    # is part of the ndjson format.
+    app_probe "index a document (/bulk)" "write" \
+        "/bulk" \
+        "{\"replace\":{\"table\":\"$MC_VERIFY_TABLE\",\"id\":1,\"doc\":{\"title\":\"config probe\"}}}
+" \
+        "application/x-ndjson" || failures=$((failures + 1))
+
+    app_probe "search (/search)" "read" \
+        "/search" \
+        "{\"table\":\"$MC_VERIFY_TABLE\",\"query\":{\"match\":{\"title\":\"probe\"}}}" \
+        "application/json" || failures=$((failures + 1))
+
+    # SHOW STATUS is the module's isAvailable() probe. If this one fails,
+    # Drupal reports the whole backend as down while search and indexing
+    # would in fact work.
+    app_probe "availability probe (SHOW STATUS)" "schema" \
+        "$MC_SQL_PATH" "SHOW STATUS" || failures=$((failures + 1))
+
+    mc_verify_cleanup
+    trap - INT TERM HUP
+
+    [ "$failures" -eq 0 ] && return 0
+    return 1
+}
+
+# Print the application password, once.
+show_password() {
+    local user="$1"
+    local password="$2"
+    echo ""
+    bold "============================================================"
+    bold "  PASSWORD for '$user' (save this NOW — shown only once):"
+    echo ""
+    printf '      %s%s%s\n' "$C_BOLD" "$password" "$C_RESET"
+    echo ""
+    bold "============================================================"
+    echo ""
+    echo "It is not stored in $ENV_FILE, or anywhere else in this repo."
+    echo "Put it straight into the Drupal Key entity your Search API"
+    echo "server uses, alongside the username '$user'."
+    echo ""
 }
 
 # -----------------------------------------------------------------------------
@@ -248,22 +734,75 @@ hash_password_for_env() {
 # -----------------------------------------------------------------------------
 cmd_show() {
     if [ ! -f "$ENV_FILE" ]; then
-        warn "No $ENV_FILE found. Run 'config setup' to create one."
+        warn "No $ENV_FILE found. Run './config setup' to create one."
         return 1
     fi
-    local domain email username hash
+    local domain email username token
     domain=$(get_env_var MANTICORE_DOMAIN || true)
     email=$(get_env_var MANTICORE_ACME_EMAIL || true)
     username=$(get_env_var MANTICORE_USERNAME || true)
-    hash=$(get_env_var MANTICORE_PASSWORD_HASH || true)
+    token=$(get_env_var MANTICORE_ADMIN_TOKEN || true)
 
     bold "Current configuration ($ENV_FILE)"
     printf '\n'
     printf '  MANTICORE_DOMAIN       = %s\n'  "${domain:-${C_YELLOW}(not set)${C_RESET}}"
     printf '  MANTICORE_ACME_EMAIL   = %s\n'  "${email:-${C_YELLOW}(not set)${C_RESET}}"
     printf '  MANTICORE_USERNAME     = %s\n'  "${username:-${C_YELLOW}(not set)${C_RESET}}"
-    printf '  MANTICORE_PASSWORD_HASH= %s\n'  "$(mask_hash "$hash")"
+    printf '  MANTICORE_ADMIN_TOKEN  = %s\n'  "$(mask_token "$token")"
     printf '\n'
+    echo "  The application user's password is not stored here."
+    echo "  Issue a new one with './config password change'."
+    printf '\n'
+
+    # The engine's own state. This is best-effort on purpose: a stopped
+    # stack or a missing token is exactly the sort of thing an operator runs
+    # `show` to diagnose, so it warns instead of failing.
+    bold "Engine users and grants"
+    printf '\n'
+    if ! mc_auth_admin 2>/dev/null; then
+        warn "  No admin token in $ENV_FILE — cannot query the engine."
+        warn "  Run './config setup'."
+        printf '\n'
+        return 0
+    fi
+
+    local users perms user
+    if ! users=$(mc_user_list); then
+        warn "  Could not read the engine's users (see the error above)."
+        printf '\n'
+        return 0
+    fi
+
+    perms=$(mc_permissions || true)
+    for user in $users; do
+        printf '  %s\n' "$user"
+        printf '%s\n' "$perms" | awk -v u="$user" '$1 == u { printf "      %s on %s\n", $2, $3 }'
+    done
+    printf '\n'
+    echo "  Internal (system.*) accounts are deliberately not listed."
+    printf '\n'
+}
+
+# -----------------------------------------------------------------------------
+# Subcommand: check
+# -----------------------------------------------------------------------------
+# An authenticated query. The compose healthcheck deliberately accepts an
+# unauthenticated 401 as "alive", because it has to be green before any admin
+# exists — so it proves the daemon is listening, not that it can execute
+# anything. This closes that gap.
+cmd_check() {
+    mc_auth_admin || return 1
+    info "Running an authenticated query against ${MC_HOST}:${MC_PORT}..."
+    if mc_sql 'SELECT 1' >/dev/null; then
+        ok "The engine accepted the admin token and executed a query."
+        echo ""
+        echo "Note: this checks the admin credential from $ENV_FILE. The"
+        echo "application user's password is not stored, so it cannot be"
+        echo "checked here — './config password change' verifies a new one"
+        echo "at the moment it is issued."
+        return 0
+    fi
+    return 1
 }
 
 # -----------------------------------------------------------------------------
@@ -273,7 +812,7 @@ cmd_domain() {
     local value="${1:-}"
     if [ -z "$value" ]; then
         err "Error: domain value required."
-        echo "Usage: docker compose run --rm -it config domain <fqdn>" >&2
+        echo "Usage: ./config domain <fqdn>" >&2
         return 1
     fi
     if ! validate_domain "$value"; then
@@ -304,7 +843,7 @@ cmd_email() {
     local value="${1:-}"
     if [ -z "$value" ]; then
         err "Error: email value required."
-        echo "Usage: docker compose run --rm -it config email <addr>" >&2
+        echo "Usage: ./config email <addr>" >&2
         return 1
     fi
     if ! validate_email "$value"; then
@@ -329,64 +868,99 @@ cmd_email() {
 # -----------------------------------------------------------------------------
 # Subcommand: username <value>
 # -----------------------------------------------------------------------------
+# Changes MANTICORE_USERNAME and makes the engine match.
+#
+# The engine has no rename: there is no ALTER USER and no RENAME USER, only
+# CREATE and DROP. A "rename" is therefore a new user with a new password,
+# and the old one is dropped separately and only if the operator says so.
+# That also means the Drupal Key entity has to be updated — the old password
+# cannot be carried across.
 cmd_username() {
     local value="${1:-}"
     if [ -z "$value" ]; then
         err "Error: username value required."
-        echo "Usage: docker compose run --rm -it config username <name>" >&2
+        echo "Usage: ./config username <name>" >&2
         return 1
     fi
     if ! validate_username "$value"; then
         err "Error: '$value' is not a valid username."
         echo "Expected: 1-32 chars, letters/digits/underscore/hyphen." >&2
+        echo "A colon in particular would break HTTP Basic authentication." >&2
         return 1
     fi
-    if ! preview_change MANTICORE_USERNAME "$value"; then
+
+    mc_auth_admin || return 1
+    mc_load_users || return 1
+
+    local current
+    current=$(get_env_var MANTICORE_USERNAME 2>/dev/null || true)
+
+    if [ "$current" = "$value" ] && mc_user_exists "$value"; then
+        info "No change: MANTICORE_USERNAME is already '$value' and the user exists."
         return 0
     fi
-    if confirm "Apply this change?"; then
-        set_env_var MANTICORE_USERNAME "$value"
-        restore_env_ownership
-        ok "Updated MANTICORE_USERNAME."
-        remind_recreate_caddy
-        return 10
+
+    if [ "$current" != "$value" ]; then
+        echo ""
+        info "This creates the user '$value' in the engine and points"
+        info "$ENV_FILE at it. The engine cannot rename a user, so '$value'"
+        info "gets a NEW password — Drupal's Key entity must be updated."
+        preview_change MANTICORE_USERNAME "$value" || true
+        if ! confirm "Apply this change?"; then
+            info "Aborted. $ENV_FILE was not modified."
+            return 0
+        fi
+    fi
+
+    local password=""
+    if mc_user_exists "$value"; then
+        info "The user '$value' already exists in the engine; keeping its"
+        info "current password. Use './config password change' to issue a"
+        info "new one."
     else
-        info "Aborted. $ENV_FILE was not modified."
-        return 0
+        password=$(generate_password)
+        require_password "$password" || return 1
+        mc_create_user "$value" "$password" || return 1
+        ok "Created engine user '$value'."
     fi
-}
 
-# -----------------------------------------------------------------------------
-# Subcommand: password generate
-# -----------------------------------------------------------------------------
-cmd_password_generate() {
-    local password escaped_hash
-    password=$(generate_password)
-    escaped_hash=$(hash_password_for_env "$password")
+    mc_ensure_grants "$value" || return 1
 
-    echo ""
-    bold "============================================================"
-    bold "  PASSWORD (save this NOW — it will not be shown again):"
-    echo ""
-    printf '      %s%s%s\n' "$C_BOLD" "$password" "$C_RESET"
-    echo ""
-    bold "============================================================"
-    echo ""
+    set_env_var MANTICORE_USERNAME "$value"
+    restore_env_ownership
+    ok "Updated MANTICORE_USERNAME."
 
-    if ! preview_change MANTICORE_PASSWORD_HASH "$escaped_hash"; then
-        return 0
+    if [ -n "$password" ]; then
+        mc_verify_app "$value" "$password" ||
+            warn "The new credential did not pass every check — see above."
+        show_password "$value" "$password"
     fi
-    if confirm "Apply this change?"; then
-        set_env_var MANTICORE_PASSWORD_HASH "$escaped_hash"
-        restore_env_ownership
-        ok "Updated MANTICORE_PASSWORD_HASH."
-        remind_recreate_caddy
-        return 10
-    else
-        info "Aborted. $ENV_FILE was not modified."
-        warn "The generated password above is now lost. Re-run to generate a new one."
-        return 0
+
+    # The old user is left in place unless the operator says otherwise:
+    # dropping it invalidates whatever is still using it.
+    #
+    # Reloaded because the list was read before '$value' was created — the
+    # answer for '$current' would not change, but reasoning about which
+    # snapshot is current is exactly the trap this pattern exists to close.
+    mc_load_users || return 1
+    if [ -n "$current" ] && [ "$current" != "$value" ] && mc_user_exists "$current"; then
+        echo ""
+        info "The previous user '$current' still exists in the engine, with"
+        info "its own password and grants. Anything still configured with it"
+        info "keeps working until it is dropped."
+        if confirm "Drop the engine user '$current'?"; then
+            mc_sql "DROP USER '$current'" >/dev/null || return 1
+            ok "Dropped engine user '$current'."
+        else
+            info "Kept '$current'. Dropping it later is a manual step — there"
+            info "is no subcommand for it, and this prompt will not appear"
+            info "again. As the admin, the statement is:"
+            info "  DROP USER '$current';"
+        fi
     fi
+
+    # Nothing Caddy reads has changed, so no recreate is needed.
+    return 0
 }
 
 # -----------------------------------------------------------------------------
@@ -394,8 +968,6 @@ cmd_password_generate() {
 # Prompts for the new password interactively (with confirmation) — never
 # accepts the password as an argument, since CLI arguments leak through
 # shell history, process listings (ps aux), and SSH session logs.
-# For automation, ship a pre-populated .env via your deployment tool
-# instead of invoking this command.
 # -----------------------------------------------------------------------------
 cmd_password_change() {
     # Reject any positional argument — guards against accidental misuse
@@ -406,41 +978,65 @@ cmd_password_change() {
         echo "Passwords passed on the command line are stored in shell history" >&2
         echo "and visible in process listings — that is unsafe." >&2
         echo "" >&2
-        echo "Run the command without arguments to enter your password" >&2
-        echo "interactively (input is hidden):" >&2
+        echo "Run the command without arguments:" >&2
         echo "" >&2
         echo "  ./config password change" >&2
-        echo "" >&2
-        echo "For automation, deploy a pre-populated .env file via your" >&2
-        echo "configuration management tool instead." >&2
         return 1
     fi
 
-    local plaintext
-    plaintext=$(prompt_password_with_confirm)
+    mc_auth_admin || return 1
+    mc_load_users || return 1
 
-    local escaped_hash
-    escaped_hash=$(hash_password_for_env "$plaintext")
+    local user
+    user=$(get_env_var MANTICORE_USERNAME 2>/dev/null || true)
+    if [ -z "$user" ]; then
+        err "No MANTICORE_USERNAME in $ENV_FILE."
+        echo "Run './config setup' first." >&2
+        return 1
+    fi
+    if ! mc_user_exists "$user"; then
+        err "The engine has no user '$user'."
+        echo "Create it with './config username $user'." >&2
+        return 1
+    fi
 
-    # Wipe plaintext from memory as soon as possible. POSIX sh has no
-    # explicit memory zeroing primitive, but unsetting the variable
-    # removes the value from the shell's scope at minimum.
-    plaintext=""
-    unset plaintext
+    bold "New password for the application user '$user'"
+    echo ""
+    echo "  1) Generate a strong random password (recommended)"
+    echo "  2) Enter your own password"
+    echo ""
+    local choice password generated=no
+    while :; do
+        printf '%sChoice%s [1]: ' "$C_BOLD" "$C_RESET"
+        read -r choice || choice=""
+        [ -z "$choice" ] && choice="1"
+        case "$choice" in
+            1) password=$(generate_password); generated=yes; break ;;
+            2) password=$(prompt_password_with_confirm); break ;;
+            *) err "  Please answer 1 or 2." ;;
+        esac
+    done
+    require_password "$password" || return 1
 
-    if ! preview_change MANTICORE_PASSWORD_HASH "$escaped_hash"; then
+    echo ""
+    warn "This replaces the password Drupal is using right now. Indexing and"
+    warn "search will fail until the Key entity is updated."
+    if ! confirm "Change the password for '$user'?"; then
+        info "Aborted. Nothing was changed."
+        [ "$generated" = "yes" ] && info "The generated password was discarded."
         return 0
     fi
-    if confirm "Apply this change?"; then
-        set_env_var MANTICORE_PASSWORD_HASH "$escaped_hash"
-        restore_env_ownership
-        ok "Updated MANTICORE_PASSWORD_HASH."
-        remind_recreate_caddy
-        return 10
-    else
-        info "Aborted. $ENV_FILE was not modified."
-        return 0
-    fi
+
+    mc_set_password "$user" "$password" || return 1
+    ok "Password changed in the engine."
+
+    # Verify with the password we just set, before it is displayed and
+    # forgotten — the same three probes the wizard runs.
+    mc_verify_app "$user" "$password" ||
+        warn "The new credential did not pass every check — see above."
+
+    show_password "$user" "$password"
+    return 0
 }
 
 # -----------------------------------------------------------------------------
@@ -450,19 +1046,71 @@ cmd_password() {
     local action="${1:-}"
     shift 2>/dev/null || true
     case "$action" in
-        generate) cmd_password_generate "$@" ;;
-        change)   cmd_password_change "$@" ;;
+        change) cmd_password_change "$@" ;;
         "")
             err "Error: password subcommand required."
             echo "" >&2
             echo "Available actions:" >&2
-            echo "  generate          Generate a random password" >&2
-            echo "  change            Prompt for password interactively" >&2
+            echo "  change            New password for the application user" >&2
             return 1
             ;;
         *)
             err "Error: unknown password subcommand: $action"
-            echo "Try: generate, change" >&2
+            echo "Try: change" >&2
+            return 1
+            ;;
+    esac
+}
+
+# -----------------------------------------------------------------------------
+# Subcommand: token rotate
+# -----------------------------------------------------------------------------
+cmd_token_rotate() {
+    mc_auth_admin || return 1
+
+    echo ""
+    warn "Rotating the admin token invalidates the current one immediately."
+    warn "Anything using MANTICORE_ADMIN_TOKEN elsewhere will stop working."
+    if ! confirm "Rotate the admin token?"; then
+        info "Aborted. Nothing was changed."
+        return 0
+    fi
+
+    local token
+    token=$(mc_issue_token "$ADMIN_USER") || return 1
+
+    set_env_var MANTICORE_ADMIN_TOKEN "$token"
+    restore_env_ownership
+    ok "Wrote a new MANTICORE_ADMIN_TOKEN to $ENV_FILE."
+
+    # Prove the value we just stored actually works.
+    mc_auth_admin || return 1
+    if mc_sql 'SELECT 1' >/dev/null; then
+        ok "The new token authenticates."
+    else
+        err "The new token did not authenticate — see the error above."
+        return 1
+    fi
+
+    # Caddy holds no credentials, so nothing needs recreating.
+    return 0
+}
+
+cmd_token() {
+    local action="${1:-}"
+    shift 2>/dev/null || true
+    case "$action" in
+        rotate) cmd_token_rotate "$@" ;;
+        "")
+            err "Error: token subcommand required."
+            echo "" >&2
+            echo "Available actions:" >&2
+            echo "  rotate            Issue a new admin token" >&2
+            return 1
+            ;;
+        *)
+            err "Error: unknown token subcommand: $action"
+            echo "Try: rotate" >&2
             return 1
             ;;
     esac
@@ -515,14 +1163,15 @@ prompt_value() {
 prompt_password_with_confirm() {
     local pwd1 pwd2
     # Show rules up front so the user knows what is acceptable before
-    # typing anything. We deliberately do not enforce a complex
-    # character-class policy — for a bcrypt-hashed Basic Auth secret,
-    # length matters far more than character variety.
+    # typing anything. The two forbidden characters are not a style
+    # preference: they are the only two the engine's CREATE USER cannot
+    # parse.
     echo "Password rules:" >&2
-    echo "  - At least 8 characters." >&2
-    echo "  - Any printable characters are allowed." >&2
-    echo "  - Avoid \$ ' \" \\ \` \! if you plan to paste the password" >&2
-    echo "    into a shell command without single quotes." >&2
+    echo "  - At least 8 characters (the engine's own minimum)." >&2
+    echo "  - A single quote (') and a backslash (\\) are not allowed —" >&2
+    echo "    the engine cannot parse either one." >&2
+    echo "  - Anything else is accepted, but avoid \$ \" \` ! if you plan" >&2
+    echo "    to paste the password into a shell command unquoted." >&2
     echo "" >&2
     while :; do
         printf '%sEnter password%s (input hidden): ' "$C_BOLD" "$C_RESET" >&2
@@ -539,6 +1188,13 @@ prompt_password_with_confirm() {
             err "  Password must be at least 8 characters." >&2
             continue
         fi
+        case "$pwd1" in
+            *\'*|*\\*)
+                err "  Remove the single quote or backslash — the engine" >&2
+                err "  cannot parse either in a password." >&2
+                continue
+                ;;
+        esac
 
         printf '%sConfirm password%s (input hidden): ' "$C_BOLD" "$C_RESET" >&2
         stty -echo 2>/dev/null || true
@@ -555,27 +1211,98 @@ prompt_password_with_confirm() {
     done
 }
 
-cmd_setup() {
+# Refuse a phase that only makes sense when the host wrapper is driving.
+require_wrapper() {
+    [ "$CONFIG_WRAPPER" = "1" ] && return 0
+    err "Error: '$1' is part of './config setup' and needs the host wrapper."
+    echo "" >&2
+    echo "The engine's admin is bootstrapped by a local searchd call that" >&2
+    echo "cannot be made from this container. Run:" >&2
+    echo "  ./config setup" >&2
+    return 1
+}
+
+# Tell the operator which upgrade they are in the middle of, before anything
+# is written. There are two distinct 1.0.0 starting points and they need
+# different things said to them.
+announce_env_state() {
+    local hash token
+
+    if [ ! -f "$ENV_FILE" ]; then
+        hash=""
+        token=""
+    else
+        hash=$(get_env_var MANTICORE_PASSWORD_HASH 2>/dev/null || true)
+        token=$(get_env_var MANTICORE_ADMIN_TOKEN 2>/dev/null || true)
+    fi
+
+    if [ -n "$token" ]; then
+        return 0
+    fi
+
+    echo ""
+    if [ -n "$hash" ]; then
+        # 1.0.0 Scenario B: Caddy was checking a bcrypt hash from .env.
+        bold "Upgrading from 1.0.0 (Caddy Basic Auth)"
+        echo ""
+        echo "Authentication has moved from the Caddy reverse proxy into the"
+        echo "Manticore engine, which now checks credentials itself on both"
+        echo "the HTTP and MySQL protocols."
+        echo ""
+        echo "  - MANTICORE_PASSWORD_HASH is no longer used by anything and"
+        echo "    will be removed from $ENV_FILE."
+        echo "  - The application user is created in the engine, with a new"
+        echo "    password shown to you once."
+        echo "  - Caddy keeps doing TLS, and nothing else."
+        echo ""
+        echo "On the Drupal side this is a small change: the connector's"
+        echo "settings keep the same shape (URL, username, password key), so"
+        echo "only the value inside the Key entity needs updating."
+    else
+        # Either a fresh install, or 1.0.0 Scenario A, which had no
+        # credentials at all. The second case is the one that can surprise
+        # someone, so it is spelled out.
+        bold "Manticore now requires credentials"
+        echo ""
+        echo "The engine authenticates every request, in every deployment —"
+        echo "including a local one with no reverse proxy in front of it."
+        echo ""
+        echo "If you are upgrading from 1.0.0 without Caddy, this is new:"
+        echo "requests that used to work with no credentials will return"
+        echo "HTTP 401 from now on. Your Drupal connector needs a username"
+        echo "and a Key entity holding the password for the first time."
+        echo ""
+        echo "Your indexed data is not affected."
+    fi
+    echo ""
+    confirm "Continue?" || return 1
+}
+
+# Phase 1 of the wizard: collect .env values. Touches nothing else, so
+# aborting here leaves the engine exactly as it was.
+#   Exit 11 = values written, the wrapper should continue.
+#   Exit 0  = aborted or nothing to do.
+cmd_setup_collect() {
+    require_wrapper setup-collect || return 1
+
     bold "============================================================"
     bold "  Manticore Search Docker Stack — interactive setup"
     bold "============================================================"
-    echo ""
 
-    # Step 1: existing .env check.
+    announce_env_state || { info "Aborted. Nothing was changed."; return 0; }
+
     if [ -f "$ENV_FILE" ]; then
-        local cur_domain cur_email cur_username cur_hash
+        local cur_domain cur_email cur_username
         cur_domain=$(get_env_var MANTICORE_DOMAIN 2>/dev/null || true)
         cur_email=$(get_env_var MANTICORE_ACME_EMAIL 2>/dev/null || true)
         cur_username=$(get_env_var MANTICORE_USERNAME 2>/dev/null || true)
-        cur_hash=$(get_env_var MANTICORE_PASSWORD_HASH 2>/dev/null || true)
 
         local empty_count=0
         [ -z "$cur_domain" ]   && empty_count=$((empty_count + 1))
         [ -z "$cur_email" ]    && empty_count=$((empty_count + 1))
         [ -z "$cur_username" ] && empty_count=$((empty_count + 1))
-        [ -z "$cur_hash" ]     && empty_count=$((empty_count + 1))
 
-        # Note: .env.example ships with non-empty placeholders for the first
+        # Note: .env.example ships with non-empty placeholders for all
         # three fields (search.example.com, admin@example.com, drupal).
         # Those count as "filled" for the empty_count above, but they are
         # placeholders, not real values. The wizard treats them as defaults
@@ -584,10 +1311,9 @@ cmd_setup() {
             warn ".env already exists and is fully populated."
             echo "" >&2
             echo "Current values:" >&2
-            echo "  MANTICORE_DOMAIN       = $cur_domain" >&2
-            echo "  MANTICORE_ACME_EMAIL   = $cur_email" >&2
-            echo "  MANTICORE_USERNAME     = $cur_username" >&2
-            echo "  MANTICORE_PASSWORD_HASH= $(mask_hash "$cur_hash")" >&2
+            echo "  MANTICORE_DOMAIN     = $cur_domain" >&2
+            echo "  MANTICORE_ACME_EMAIL = $cur_email" >&2
+            echo "  MANTICORE_USERNAME   = $cur_username" >&2
             echo "" >&2
             if ! confirm "Re-run setup and overwrite these values?"; then
                 info "Aborted. No changes made."
@@ -602,8 +1328,8 @@ cmd_setup() {
     fi
     echo ""
 
-    # Step 2: domain.
-    bold "Step 1 of 4 — Domain name"
+    # Step 1: domain.
+    bold "Step 1 of 3 — Domain name"
     echo "The fully-qualified hostname pointing at this VPS, with a public"
     echo "DNS A record. Example: search.example.com"
     echo "Rules: lowercase letters, digits, hyphens and dots only."
@@ -618,8 +1344,8 @@ cmd_setup() {
         "lowercase letters, digits, hyphens and dots only")
     echo ""
 
-    # Step 3: email.
-    bold "Step 2 of 4 — ACME email"
+    # Step 2: email.
+    bold "Step 2 of 3 — ACME email"
     echo "Email address used by Let's Encrypt for renewal notices."
     echo "Rules: standard email form, e.g. admin@example.com."
     echo ""
@@ -631,86 +1357,141 @@ cmd_setup() {
         "must look like name@domain.tld")
     echo ""
 
-    # Step 4: username.
-    bold "Step 3 of 4 — HTTP Basic Auth username"
-    echo "Username the Drupal application will authenticate as."
+    # Step 3: username.
+    bold "Step 3 of 3 — Application username"
+    echo "The engine user the Drupal site will authenticate as. It will be"
+    echo "created with exactly the grants the module needs, and a password"
+    echo "shown to you once at the end."
     echo "Rules: 1-32 characters, ASCII letters/digits/underscore/hyphen."
     echo ""
+    # Unlike the domain and email placeholders above, 'drupal' is NOT
+    # stripped. Those two are stripped because search.example.com and
+    # admin@example.com cannot work anywhere, so offering them as a default
+    # only invites a broken deployment. 'drupal' is a working value and the
+    # documented default — blanking it would force the operator to retype
+    # their real username on every re-run of the wizard.
     local default_username
     default_username=$(get_env_var MANTICORE_USERNAME 2>/dev/null || true)
-    [ "$default_username" = "drupal" ] && default_username=""
     local new_username
     new_username=$(prompt_value "Username" "$default_username" validate_username \
         "1-32 chars, letters/digits/underscore/hyphen")
     echo ""
 
-    # Step 5: password.
-    bold "Step 4 of 4 — HTTP Basic Auth password"
-    echo "How would you like to set the password?"
-    echo ""
-    echo "  1) Generate a strong random password (recommended)"
-    echo "  2) Enter your own password"
-    echo ""
-    local choice new_password
-    while :; do
-        printf '%sChoice%s [1]: ' "$C_BOLD" "$C_RESET"
-        read -r choice || choice=""
-        [ -z "$choice" ] && choice="1"
-        case "$choice" in
-            1)
-                new_password=$(generate_password)
-                echo ""
-                bold "============================================================"
-                bold "  PASSWORD (save this NOW — it will not be shown again):"
-                echo ""
-                printf '      %s%s%s\n' "$C_BOLD" "$new_password" "$C_RESET"
-                echo ""
-                bold "============================================================"
-                break
-                ;;
-            2)
-                new_password=$(prompt_password_with_confirm)
-                break
-                ;;
-            *)
-                err "  Please answer 1 or 2."
-                ;;
-        esac
-    done
-    echo ""
-
-    # Step 6: summary + final confirmation.
-    local new_hash
-    new_hash=$(hash_password_for_env "$new_password")
-
     bold "Summary"
     echo ""
-    echo "  MANTICORE_DOMAIN       = $new_domain"
-    echo "  MANTICORE_ACME_EMAIL   = $new_email"
-    echo "  MANTICORE_USERNAME     = $new_username"
-    echo "  MANTICORE_PASSWORD_HASH= $(mask_hash "$new_hash")"
+    echo "  MANTICORE_DOMAIN     = $new_domain"
+    echo "  MANTICORE_ACME_EMAIL = $new_email"
+    echo "  MANTICORE_USERNAME   = $new_username"
+    echo ""
+    echo "Next, the engine's admin is bootstrapped and the user above is"
+    echo "created. Nothing has been changed yet."
     echo ""
 
-    if ! confirm "Write these values to $ENV_FILE?"; then
+    if ! confirm "Write these values to $ENV_FILE and continue?"; then
         warn "Aborted. $ENV_FILE was not modified."
-        if [ "$choice" = "1" ]; then
-            warn "The generated password is now lost."
-        fi
         return 0
     fi
 
-    # Step 7: write everything.
-    set_env_var MANTICORE_DOMAIN         "$new_domain"
-    set_env_var MANTICORE_ACME_EMAIL     "$new_email"
-    set_env_var MANTICORE_USERNAME       "$new_username"
-    set_env_var MANTICORE_PASSWORD_HASH  "$new_hash"
+    set_env_var MANTICORE_DOMAIN     "$new_domain"
+    set_env_var MANTICORE_ACME_EMAIL "$new_email"
+    set_env_var MANTICORE_USERNAME   "$new_username"
+
+    # Dead since authentication moved into the engine.
+    if [ -n "$(get_env_var MANTICORE_PASSWORD_HASH 2>/dev/null || true)" ]; then
+        del_env_var MANTICORE_PASSWORD_HASH
+        info "Removed MANTICORE_PASSWORD_HASH — nothing reads it any more."
+    fi
+
     restore_env_ownership
+    ok "$ENV_FILE written."
+    return 11
+}
+
+# Phase 2 of the wizard: everything that needs the engine. By the time this
+# runs the host wrapper has bootstrapped the admin and written
+# MANTICORE_ADMIN_TOKEN.
+cmd_setup_provision() {
+    require_wrapper setup-provision || return 1
+
+    mc_auth_admin || return 1
+    mc_load_users || return 1
+
+    local user
+    user=$(get_env_var MANTICORE_USERNAME 2>/dev/null || true)
+    if [ -z "$user" ]; then
+        err "No MANTICORE_USERNAME in $ENV_FILE."
+        return 1
+    fi
 
     echo ""
-    ok "Setup complete. $ENV_FILE has been written."    echo ""
+    bold "Application user"
+    echo ""
+
+    local password=""
+    if mc_user_exists "$user"; then
+        info "The engine already has a user '$user'."
+        echo ""
+        echo "Answering 'no' keeps its current password, so a Drupal site"
+        echo "already configured with it keeps working."
+        echo ""
+        if confirm "Issue a new password for '$user'?"; then
+            password=$(generate_password)
+            require_password "$password" || return 1
+            mc_set_password "$user" "$password" || return 1
+            ok "New password set for '$user'."
+        else
+            info "Keeping the existing password for '$user'."
+        fi
+    else
+        password=$(generate_password)
+        require_password "$password" || return 1
+        mc_create_user "$user" "$password" || return 1
+        ok "Created engine user '$user'."
+    fi
+
+    echo ""
+    info "Grants for '$user':"
+    mc_ensure_grants "$user" || return 1
+
+    echo ""
+    info "Checking that the engine executes queries..."
+    if mc_sql 'SELECT 1' >/dev/null; then
+        ok "Admin credential works."
+    else
+        return 1
+    fi
+
+    local verify_failed=no
+    if [ -n "$password" ]; then
+        echo ""
+        mc_verify_app "$user" "$password" || verify_failed=yes
+    fi
+
+    echo ""
+    ok "Setup complete."
+
+    if [ "$verify_failed" = "yes" ]; then
+        echo ""
+        warn "One or more checks on the application credential failed — see"
+        warn "above. The password is shown below regardless, since you will"
+        warn "need it either way."
+    fi
+
+    if [ -n "$password" ]; then
+        show_password "$user" "$password"
+    else
+        echo ""
+        info "The password for '$user' was left unchanged and is not shown."
+        info "Issue a new one with './config password change'."
+        echo ""
+    fi
+
+    local domain
+    domain=$(get_env_var MANTICORE_DOMAIN 2>/dev/null || true)
+
     bold "Next steps:"
     echo ""
-    echo "  # 1. Make sure DNS A record for '$new_domain' points to this VPS."
+    echo "  # 1. Make sure the DNS A record for '$domain' points to this VPS."
     echo ""
 
     case "$CADDY_RUNNING" in
@@ -737,9 +1518,12 @@ cmd_setup() {
     echo "  # 3. Watch Caddy obtain the Let's Encrypt certificate (10-30s):"
     echo "  docker compose logs -f caddy"
     echo ""
-    echo "  # 4. Test from anywhere:"
-    echo "  curl -u '$new_username:<the-password-above>' \\"
-    echo "       https://$new_domain/cli -d 'SHOW STATUS'"
+    echo "  # 4. Test from anywhere, as the application user:"
+    echo "  curl -s -u '$user:<the-password-above>' \\"
+    echo "       https://$domain/sql?mode=raw -d 'SHOW STATUS'"
+    echo ""
+    echo "  # 5. Put the username and password into Drupal: Search API server"
+    echo "  #    settings, with the password held in a Key entity."
     echo ""
     return 10
 }
@@ -750,28 +1534,28 @@ cmd_setup() {
 print_usage() {
     cat >&2 <<'USAGE'
 Usage:
-  docker compose run --rm -it config <subcommand> [args...]
-
-  Or via the host-side wrapper:
   ./config <subcommand> [args...]
 
 Subcommands:
   setup                         Interactive wizard for first-time config
-  show                          Display current .env (hash masked)
+  show                          Display .env plus the engine's users/grants
+  check                         Authenticated query against the engine
   domain <fqdn>                 Set MANTICORE_DOMAIN
   email <addr>                  Set MANTICORE_ACME_EMAIL
-  username <name>               Set MANTICORE_USERNAME
-  password generate             Generate a random password and hash
-  password change               Prompt for password interactively and hash
+  username <name>               Set MANTICORE_USERNAME and create the user
+  password change               New password for the application user
+  token rotate                  New admin token in .env
+  admin reset                   Wipe all engine users and start again
 
 Examples:
   ./config setup
   ./config show
+  ./config check
   ./config domain search.example.com
   ./config email admin@example.com
   ./config username drupal
-  ./config password generate
   ./config password change
+  ./config token rotate
 USAGE
 }
 
@@ -784,12 +1568,28 @@ main() {
     shift 2>/dev/null || true
 
     case "$cmd" in
-        show)     cmd_show "$@" ;;
-        domain)   cmd_domain "$@" ;;
-        email)    cmd_email "$@" ;;
-        username) cmd_username "$@" ;;
-        password) cmd_password "$@" ;;
-        setup)    cmd_setup "$@" ;;
+        show)             cmd_show "$@" ;;
+        check)            cmd_check "$@" ;;
+        domain)           cmd_domain "$@" ;;
+        email)            cmd_email "$@" ;;
+        username)         cmd_username "$@" ;;
+        password)         cmd_password "$@" ;;
+        token)            cmd_token "$@" ;;
+        setup-collect)    cmd_setup_collect "$@" ;;
+        setup-provision)  cmd_setup_provision "$@" ;;
+        setup)
+            # The wizard needs the host-side bootstrap in the middle, so the
+            # wrapper drives it in phases rather than this script running it
+            # end to end.
+            err "Error: run the wizard through the host wrapper:"
+            echo "  ./config setup" >&2
+            return 1
+            ;;
+        admin)
+            err "Error: 'admin' is handled by the host wrapper:"
+            echo "  ./config admin reset" >&2
+            return 1
+            ;;
         help|-h|--help)
             print_usage
             ;;

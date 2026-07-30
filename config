@@ -6,30 +6,35 @@
 #   ./config <subcommand> [args...]
 #
 # Examples:
+#   ./config setup
 #   ./config show
+#   ./config check
 #   ./config domain search.example.com
 #   ./config email admin@example.com
 #   ./config username drupal
-#   ./config password generate
 #   ./config password change
-#   ./config setup
+#   ./config token rotate
+#   ./config admin reset
 #   ./config help
 #
-# Beyond forwarding arguments, the wrapper does two host-side things
-# that the in-container script cannot:
+# Most subcommands are just forwarded to bin/config.sh inside the `config`
+# container. Three things cannot be done from in there, and so live here:
 #
-#   1. Detects whether the manticore-caddy container is currently
-#      running and forwards the result to the container as
-#      CADDY_RUNNING=yes|no. The script uses this to tailor next-steps
-#      output to the actual stack state.
+#   1. The admin bootstrap. `searchd --auth-non-interactive` is a LOCAL CLI
+#      call against the daemon's own config file — there is no network
+#      equivalent — so it must run inside the manticore container itself.
 #
-#   2. After the subcommand exits, checks the exit code:
-#        - 0     no .env change (e.g. 'show', or a wizard aborted)
-#                — nothing further to do.
-#        - 10    .env was modified — if Caddy is currently running,
-#                silently recreate it so the new value takes effect.
-#                Any other exit code is treated as a real failure and
-#                propagated as-is; no recreate is performed.
+#   2. Minting the first admin token, which needs the bootstrap password.
+#      That password never leaves this script: it is generated here, passed
+#      on stdin (never in argv — see bootstrap_admin), used once, and
+#      dropped. bin/config.sh never sees it and works from the token alone.
+#
+#   3. Detecting whether the Caddy container is running, so `.env` changes
+#      that Caddy actually reads can take effect immediately.
+#
+# `./config setup` therefore runs in three parts: an interactive collection
+# phase in the container, the host-side bootstrap, then a provisioning phase
+# back in the container. Aborting during collection touches nothing.
 #
 # If `./config` fails to run with "permission denied", restore the bit:
 #   chmod +x ./config
@@ -40,6 +45,36 @@ set -eu
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 cd "$SCRIPT_DIR"
+
+ENV_FILE=".env"
+
+# The admin username created by the bootstrap. `searchd
+# --auth-non-interactive` reads it from stdin and we always answer `admin`;
+# nothing in the engine lets it be renamed afterwards.
+ADMIN_USER="admin"
+
+# Where the daemon keeps its authentication file, inside the container.
+AUTH_FILE="/var/lib/manticore/auth.json"
+
+# -----------------------------------------------------------------------------
+# Output helpers
+# -----------------------------------------------------------------------------
+if [ -t 1 ]; then
+    C_RESET="$(printf '\033[0m')"
+    C_RED="$(printf '\033[31m')"
+    C_GREEN="$(printf '\033[32m')"
+    C_YELLOW="$(printf '\033[33m')"
+    C_BLUE="$(printf '\033[36m')"
+    C_BOLD="$(printf '\033[1m')"
+else
+    C_RESET=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_BOLD=""
+fi
+
+info() { printf '%s%s%s\n' "$C_BLUE"   "$*" "$C_RESET"; }
+ok()   { printf '%s%s%s\n' "$C_GREEN"  "$*" "$C_RESET"; }
+warn() { printf '%s%s%s\n' "$C_YELLOW" "$*" "$C_RESET" >&2; }
+err()  { printf '%s%s%s\n' "$C_RED"    "$*" "$C_RESET" >&2; }
+bold() { printf '%s%s%s\n' "$C_BOLD"   "$*" "$C_RESET"; }
 
 # -----------------------------------------------------------------------------
 # Detect whether the Caddy container is currently running. Exact name match
@@ -52,36 +87,378 @@ if docker ps --filter "name=^manticore-caddy$" --format '{{.Names}}' 2>/dev/null
 fi
 
 # -----------------------------------------------------------------------------
-# Run the subcommand. Disable errexit around the call so we can capture
-# the exit code and react to it.
+# Run bin/config.sh in the container. CONFIG_WRAPPER tells it that it was
+# invoked through this wrapper, so it can refuse the phases that depend on
+# host-side work instead of failing obscurely under a bare
+# `docker compose run`.
 # -----------------------------------------------------------------------------
-set +e
-docker compose run --rm -it \
-    -e HOST_UID="$(id -u)" \
-    -e HOST_GID="$(id -g)" \
-    -e CADDY_RUNNING="$CADDY_RUNNING" \
-    config "$@"
-RC=$?
-set -e
+run_config() {
+    docker compose run --rm -it \
+        -e HOST_UID="$(id -u)" \
+        -e HOST_GID="$(id -g)" \
+        -e CADDY_RUNNING="$CADDY_RUNNING" \
+        -e CONFIG_WRAPPER=1 \
+        config "$@"
+}
 
-# -----------------------------------------------------------------------------
-# Interpret the exit code:
-#   10            .env changed — proceed to the recreate logic below.
-#   0             no change — exit 0 silently.
-#   anything else real error — propagate verbatim.
-# -----------------------------------------------------------------------------
-if [ "$RC" -eq 0 ]; then
-    exit 0
-fi
-if [ "$RC" -ne 10 ]; then
-    exit "$RC"
-fi
-
-# -----------------------------------------------------------------------------
-# .env was modified. If Caddy is running, recreate it so the new value
-# takes effect. If not, there is nothing to do — the value will be
-# picked up the next time the stack is brought up.
-# -----------------------------------------------------------------------------
-if [ "$CADDY_RUNNING" = "yes" ]; then
+# Recreate Caddy if it is running, so a changed value takes effect. Only
+# MANTICORE_DOMAIN and MANTICORE_ACME_EMAIL are read by Caddy — it holds no
+# credentials any more — so only those changes come through here.
+recreate_caddy_if_running() {
+    [ "$CADDY_RUNNING" = "yes" ] || return 0
     docker compose --profile public up -d --force-recreate caddy
-fi
+}
+
+# -----------------------------------------------------------------------------
+# Engine helpers
+# -----------------------------------------------------------------------------
+
+# Bring the daemon up (if it is not already) and wait for it to be healthy.
+# The bootstrap needs a running daemon. `--wait` blocks until the compose
+# healthcheck passes; that check is green in every auth state, including
+# "auth on, no admin yet", which is exactly the state we are about to fix.
+ensure_manticore_running() {
+    info "Making sure the manticore service is up..."
+    if ! docker compose up -d --wait manticore; then
+        err "Could not start the manticore service."
+        return 1
+    fi
+}
+
+# True when the daemon already has an admin — tested exactly the way the
+# daemon tests it: a non-empty auth.json. Re-running the bootstrap over a
+# populated file is a hard failure ("... is not empty, can not create
+# administrator login"), so this is what keeps setup re-runnable.
+auth_is_bootstrapped() {
+    docker compose exec -T manticore sh -c "[ -s '$AUTH_FILE' ]" 2>/dev/null
+}
+
+# Generate a password from the same alphabet as generate_password() in
+# bin/config.sh — [A-Za-z0-9_.-], 24 characters. That function is the
+# canonical copy; keep the two in step. The alphabet is not arbitrary: `'`
+# and `\` are the only two characters that break CREATE USER, and this set
+# excludes both, so the value never needs escaping in SQL or in HTTP Basic.
+#
+# LC_ALL=C because this one runs on the operator's host, not in the fixed
+# locale of the container: BSD and macOS tr can abort on the invalid
+# multibyte sequences /dev/urandom is full of unless the locale is C.
+gen_password() {
+    LC_ALL=C tr -dc 'A-Za-z0-9_.-' </dev/urandom | head -c 24
+}
+
+# Fail loudly rather than let an empty password reach the daemon, where it
+# would come back as "password must be at least 8 characters" and point the
+# operator at entirely the wrong problem.
+require_password() {
+    [ -n "${1:-}" ] && return 0
+    err "Password generation failed (empty value from /dev/urandom)."
+    return 1
+}
+
+# Bootstrap the admin. Three details are load-bearing:
+#
+#   - The password arrives on STDIN. Interpolating it into the command line
+#     would put it in this host's process list, where any local user could
+#     read it — the whole reason the password stays on the host is to avoid
+#     exactly that kind of exposure.
+#   - `-u manticore`. As root, searchd writes a root:root auth.json that the
+#     daemon (running as manticore) cannot read: the bootstrap reports
+#     failure, the admin works on neither protocol, and it only repairs
+#     itself on the next container start.
+#   - `manticore.conf.sh`, not `manticore.conf`. The `.sh` file is the
+#     generator the image's own Cmd uses; the static `.conf` has
+#     loopback-only listeners and no auth, so bootstrapping against it
+#     configures something other than the running daemon.
+bootstrap_admin() {
+    require_password "${1:-}" || return 1
+    printf '%s\n%s\n%s\n' "$ADMIN_USER" "$1" "$1" |
+        docker compose exec -T -u manticore manticore \
+            searchd --config /etc/manticoresearch/manticore.conf.sh \
+                    --auth-non-interactive
+}
+
+# Mint the admin bearer token, using the daemon container's own wget so the
+# host needs no HTTP client.
+#
+# The password again goes in on stdin and the Basic header is built inside
+# the container; the script text itself is not sensitive, so it travels as
+# an argument to `sh -c` and leaves stdin free for the password. The encoded
+# credential does end up in the container's wget argv — an accepted
+# tradeoff, since reading it requires access to the container, which is
+# already root-equivalent here, whereas the host process list is readable by
+# every local user.
+#
+# `base64 | tr -d '\n'` rather than `base64 -w0`: -w is a GNU coreutils
+# extension and this should not care which base64 the image ships.
+#
+# The username is always explicit. A bare `TOKEN` rotates the credential of
+# whichever user the connection is authenticated as — over some endpoints
+# that is the internal system.buddy account, which permanently breaks Buddy.
+mint_admin_token() {
+    require_password "${1:-}" || return 1
+
+    # Quoted here-doc: nothing in the body is expanded here, so the SQL's
+    # single quotes and the inner $(...) survive to the container's shell.
+    _mint=$(cat <<'MINT'
+read -r pw
+wget -q --content-on-error -O - \
+     --header="Authorization: Basic $(printf 'admin:%s' "$pw" | base64 | tr -d '\n')" \
+     --post-data="TOKEN 'admin'" 'http://127.0.0.1:9308/sql?mode=raw'
+MINT
+)
+    _response=$(printf '%s\n' "$1" |
+        docker compose exec -T manticore sh -c "$_mint") || {
+        err "Could not mint the admin token."
+        return 1
+    }
+
+    # Same extraction as mc_token() in bin/config.sh — keep the two in step.
+    # Isolating the "data" array first stops a greedy match crossing rows,
+    # and anchoring on `"token":"` (with the quote) means the schema block's
+    # {"token":{"type":"string"}} cannot match. Parse by name, never by
+    # position: column order differs between CREATE USER and TOKEN.
+    _token=$(printf '%s' "$_response" | tr -d '\n' |
+        sed 's/.*"data":\[//; s/\].*//' |
+        sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+
+    # An empty result is a real possibility, not paranoia: some statements
+    # answer HTTP 200 with an empty data array and no error at all.
+    if [ -z "$_token" ]; then
+        err "No token in the daemon's response."
+        return 1
+    fi
+    printf '%s' "$_token"
+}
+
+# Write MANTICORE_ADMIN_TOKEN to .env and lock the file down.
+#
+# This duplicates set_env_var() in bin/config.sh, which cannot be sourced
+# from here. The duplication is safe because this function only ever writes
+# a bearer token, and every token the engine has produced is lowercase hex,
+# so there is nothing for sed to misread. Anything with a wider alphabet
+# belongs in bin/config.sh instead.
+#
+# Written through a temporary file rather than `sed -i`, which is a GNU
+# extension: BSD and macOS sed read the next argument as the backup suffix
+# and would mangle the command. Unlike bin/config.sh, this runs on the
+# operator's host, so it cannot assume GNU tools. The temporary file is
+# created private before anything is written to it, so the token is never
+# briefly world-readable.
+write_admin_token() {
+    [ -f "$ENV_FILE" ] || : > "$ENV_FILE"
+    _tmp="${ENV_FILE}.tmp.$$"
+    : > "$_tmp"
+    chmod 600 "$_tmp"
+
+    if grep -q '^MANTICORE_ADMIN_TOKEN=' "$ENV_FILE"; then
+        sed "s|^MANTICORE_ADMIN_TOKEN=.*|MANTICORE_ADMIN_TOKEN=$1|" \
+            "$ENV_FILE" > "$_tmp" || { rm -f "$_tmp"; return 1; }
+    else
+        cat "$ENV_FILE" > "$_tmp" || { rm -f "$_tmp"; return 1; }
+        # A .env whose last line has no trailing newline would otherwise get
+        # the token glued onto the end of it.
+        if [ -s "$_tmp" ] && [ "$(tail -c 1 "$_tmp" | wc -l)" -eq 0 ]; then
+            printf '\n' >> "$_tmp"
+        fi
+        printf 'MANTICORE_ADMIN_TOKEN=%s\n' "$1" >> "$_tmp"
+    fi
+
+    mv "$_tmp" "$ENV_FILE" || { rm -f "$_tmp"; return 1; }
+    # .env now holds a root-equivalent credential.
+    chmod 600 "$ENV_FILE"
+}
+
+# Bootstrap, mint, store. Used by both `setup` (first run) and
+# `admin reset` (recovery).
+bootstrap_and_store_token() {
+    _pw=$(gen_password)
+    require_password "$_pw" || return 1
+
+    info "Bootstrapping the engine's admin account..."
+    bootstrap_admin "$_pw" || {
+        err "The admin bootstrap failed. Nothing was written to $ENV_FILE."
+        return 1
+    }
+
+    info "Issuing the admin token..."
+    _tok=$(mint_admin_token "$_pw") || return 1
+
+    # The admin password has served its only purpose. It is deliberately
+    # never stored: the token in .env is the credential from here on, and
+    # it can be rotated without knowing the password.
+    _pw=""
+    unset _pw
+
+    write_admin_token "$_tok"
+    _tok=""
+    unset _tok
+    ok "Admin configured; MANTICORE_ADMIN_TOKEN written to $ENV_FILE."
+}
+
+# Does the token in .env still authenticate? `check` runs an authenticated
+# query in the container, so this reuses it rather than duplicating the
+# request here. Quiet — the caller decides what to say.
+admin_token_works() {
+    run_config check >/dev/null 2>&1
+}
+
+# -----------------------------------------------------------------------------
+# Subcommand: setup
+# -----------------------------------------------------------------------------
+# Collection runs first and only touches .env, so aborting the wizard leaves
+# the engine exactly as it was. The bootstrap happens in between, and only
+# when the engine has no admin yet.
+cmd_setup() {
+    set +e
+    run_config setup-collect
+    _rc=$?
+    set -e
+
+    # 0 = the operator aborted, or there was nothing to change.
+    # 11 = values collected, keep going.
+    [ "$_rc" -eq 0 ] && exit 0
+    [ "$_rc" -eq 11 ] || exit "$_rc"
+
+    ensure_manticore_running || exit 1
+
+    if auth_is_bootstrapped; then
+        # An admin exists. Whether we can continue depends entirely on
+        # whether we can still authenticate as it.
+        if admin_token_works; then
+            info "The engine already has an admin and the token in $ENV_FILE works."
+            info "Skipping the bootstrap and continuing with the application user."
+        else
+            echo "" >&2
+            err "The engine already has an admin, but $ENV_FILE has no token that works."
+            echo "" >&2
+            echo "The admin password is never stored, so that credential cannot be" >&2
+            echo "recovered. If you have the token elsewhere, put it in $ENV_FILE as" >&2
+            echo "MANTICORE_ADMIN_TOKEN and re-run './config setup'." >&2
+            echo "" >&2
+            echo "Otherwise reset the engine's authentication:" >&2
+            echo "  ./config admin reset" >&2
+            echo "" >&2
+            echo "That destroys every user and grant — indexed data is not touched —" >&2
+            echo "and lets you start again." >&2
+            exit 1
+        fi
+    else
+        bootstrap_and_store_token || exit 1
+    fi
+
+    set +e
+    run_config setup-provision
+    _rc=$?
+    set -e
+
+    if [ "$_rc" -eq 10 ]; then
+        recreate_caddy_if_running
+        exit 0
+    fi
+    exit "$_rc"
+}
+
+# -----------------------------------------------------------------------------
+# Subcommand: admin reset
+# -----------------------------------------------------------------------------
+# Recovery for a lost admin credential. Destructive by nature, so it asks
+# for the word to be typed out rather than a y/N.
+cmd_admin_reset() {
+    bold "============================================================"
+    bold "  Reset the engine's authentication"
+    bold "============================================================"
+    echo ""
+    warn "This DESTROYS every user, token and grant in the search engine."
+    echo ""
+    echo "  - Your indexed data is NOT touched."
+    echo "  - The application user will have to be recreated, and Drupal's"
+    echo "    Key entity updated with its new password."
+    echo "  - A new admin token will be written to $ENV_FILE."
+    echo ""
+    echo "Use this only when the admin token is lost, since the admin"
+    echo "password is never stored and cannot be recovered."
+    echo ""
+    printf 'Type %sreset%s to continue: ' "$C_BOLD" "$C_RESET"
+    read -r _answer || _answer=""
+    if [ "$_answer" != "reset" ]; then
+        info "Aborted. Nothing was changed."
+        exit 0
+    fi
+    echo ""
+
+    ensure_manticore_running || exit 1
+
+    # Truncate in place, as the manticore user. Never `rm`: a recreated file
+    # comes back root:root mode 0644, and a world-readable auth.json makes
+    # the daemon refuse to start on its next boot. Truncation keeps the
+    # owner and the 0600 mode the daemon requires.
+    info "Emptying the authentication file..."
+    docker compose exec -T -u manticore manticore \
+        sh -c ": > '$AUTH_FILE'" || {
+        err "Could not empty $AUTH_FILE."
+        exit 1
+    }
+
+    bootstrap_and_store_token || exit 1
+
+    echo ""
+    ok "Authentication reset. No restart is needed."
+    echo ""
+    bold "Next step:"
+    echo ""
+    echo "  # Recreate the application user and get a new password:"
+    echo "  ./config setup"
+    echo ""
+}
+
+cmd_admin() {
+    case "${1:-}" in
+        reset) cmd_admin_reset ;;
+        "")
+            err "Error: admin subcommand required."
+            echo "Try: ./config admin reset" >&2
+            exit 1
+            ;;
+        *)
+            err "Error: unknown admin subcommand: $1"
+            echo "Try: ./config admin reset" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# -----------------------------------------------------------------------------
+# Main router
+# -----------------------------------------------------------------------------
+# Everything not handled here goes straight to bin/config.sh. Its exit code
+# means:
+#   0             no change, or aborted — nothing to do.
+#   10            .env changed in a way Caddy reads — recreate it if running.
+#   anything else a real error — propagate verbatim.
+# -----------------------------------------------------------------------------
+case "${1:-}" in
+    setup)
+        shift
+        cmd_setup "$@"
+        ;;
+    admin)
+        shift
+        cmd_admin "$@"
+        ;;
+    setup-collect|setup-provision)
+        err "Error: '$1' is an internal phase of './config setup'."
+        echo "Run './config setup' instead." >&2
+        exit 1
+        ;;
+    *)
+        set +e
+        run_config "$@"
+        RC=$?
+        set -e
+
+        [ "$RC" -eq 0 ] && exit 0
+        [ "$RC" -ne 10 ] && exit "$RC"
+
+        recreate_caddy_if_running
+        ;;
+esac
