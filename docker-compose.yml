@@ -110,6 +110,15 @@ services:
       timeout: 5s
       retries: 3
       start_period: 30s
+      # `start_interval` is deliberately NOT set here. It would make the
+      # first probe land in seconds instead of at the first 30s interval,
+      # which matters because `./config setup` blocks on `up -d --wait` —
+      # but the healthcheck block rejects unknown keys, so any Compose whose
+      # schema predates that field (added to the spec in 2023) fails
+      # validation and refuses to start the stack at all. A stack that will
+      # not start is a far worse failure than a slow first probe. Docker
+      # Engine 25+ already defaults it to 5s when start_period is set; on
+      # older engines the wizard says what it is waiting for instead.
 
     networks:
       - manticore

@@ -117,8 +117,16 @@ recreate_caddy_if_running() {
 # The bootstrap needs a running daemon. `--wait` blocks until the compose
 # healthcheck passes; that check is green in every auth state, including
 # "auth on, no admin yet", which is exactly the state we are about to fix.
+# Says what it is waiting for, because `up -d --wait` blocks on the compose
+# healthcheck and prints nothing of its own until the container flips. On
+# Docker Engine 25+ that is a few seconds; on older engines the first probe
+# only lands at the healthcheck's 30s interval, and silence at that point —
+# right after the operator has finished answering questions — reads as a
+# hung wizard.
 ensure_manticore_running() {
-    info "Making sure the manticore service is up..."
+    info "Starting the manticore service and waiting for it to report healthy."
+    info "This is usually a few seconds, but can take up to 30 on the first"
+    info "start or on older Docker versions."
     if ! docker compose up -d --wait manticore; then
         err "Could not start the manticore service."
         return 1
@@ -302,6 +310,30 @@ admin_token_works() {
     run_config check >/dev/null 2>&1
 }
 
+# Abort the wizard after the collect phase has already written .env.
+#
+# By this point MANTICORE_DOMAIN and MANTICORE_ACME_EMAIL are on disk, but
+# the Caddy recreate only happens when provisioning succeeds — so a failure
+# here leaves a running Caddy serving the previous domain with nothing said
+# about it. Say it.
+#
+# It deliberately does NOT recreate Caddy itself: something has just gone
+# wrong, the operator is about to fix it and re-run, and swapping the
+# certificate the proxy is serving in the middle of that is not a decision
+# to make on their behalf — particularly since a brand new domain may not
+# have DNS pointed at this host yet.
+setup_failed() {
+    if [ "$CADDY_RUNNING" = "yes" ]; then
+        echo "" >&2
+        warn "Note: $ENV_FILE was updated with the domain and ACME email you"
+        warn "entered, but Caddy is still running with the previous values."
+        warn "After fixing the problem above, either re-run './config setup'"
+        warn "or recreate Caddy directly:"
+        warn "  docker compose --profile public up -d --force-recreate caddy"
+    fi
+    exit "${1:-1}"
+}
+
 # -----------------------------------------------------------------------------
 # Subcommand: setup
 # -----------------------------------------------------------------------------
@@ -319,7 +351,9 @@ cmd_setup() {
     [ "$_rc" -eq 0 ] && exit 0
     [ "$_rc" -eq 11 ] || exit "$_rc"
 
-    ensure_manticore_running || exit 1
+    # From here on .env has been written, so every failure exits through
+    # setup_failed to explain the mismatch it leaves behind.
+    ensure_manticore_running || setup_failed 1
 
     if auth_is_bootstrapped; then
         # An admin exists. Whether we can continue depends entirely on
@@ -340,10 +374,10 @@ cmd_setup() {
             echo "" >&2
             echo "That destroys every user and grant — indexed data is not touched —" >&2
             echo "and lets you start again." >&2
-            exit 1
+            setup_failed 1
         fi
     else
-        bootstrap_and_store_token || exit 1
+        bootstrap_and_store_token || setup_failed 1
     fi
 
     set +e
@@ -355,7 +389,7 @@ cmd_setup() {
         recreate_caddy_if_running
         exit 0
     fi
-    exit "$_rc"
+    setup_failed "$_rc"
 }
 
 # -----------------------------------------------------------------------------
