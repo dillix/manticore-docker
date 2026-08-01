@@ -1,8 +1,7 @@
 # Manticore Search Docker Stack
 
 A production-ready Docker Compose stack for running [Manticore Search](https://manticoresearch.com/)
-behind a [Caddy](https://caddyserver.com/) reverse proxy with automatic HTTPS
-and HTTP Basic Authentication.
+behind a [Caddy](https://caddyserver.com/) reverse proxy with automatic HTTPS.
 
 Designed to be deployed by a webmaster on a VPS in under ten minutes, with no
 prior DevOps experience. The stack is the recommended way to run a Manticore
@@ -10,8 +9,12 @@ server for use with the
 [Search API Manticore](https://www.drupal.org/project/search_api_manticore)
 Drupal module, but it is generic — any HTTP client can talk to it.
 
-- **Manticore Search 25.0** — the latest stable release
-- **Caddy 2** — automatic Let's Encrypt TLS certificates, HTTP Basic Auth
+- **Manticore Search 27.1.5** — authentication is enforced by the engine
+  itself, on both the HTTP and MySQL protocols, with users, passwords, bearer
+  tokens and per-action grants
+- **Caddy 2.11.4** — automatic Let's Encrypt TLS certificates. It terminates
+  TLS and forwards the `Authorization` header untouched; it holds no
+  credentials and checks none
 - **Production defaults** — memory locking, raised ulimits, persistent volume,
   healthcheck, automatic restart
 
@@ -23,7 +26,9 @@ Drupal module, but it is generic — any HTTP client can talk to it.
 - [Prerequisites: a sudo-capable non-root user](#prerequisites-a-sudo-capable-non-root-user)
 - [Install Docker on Ubuntu 24.04 LTS](#install-docker-on-ubuntu-2404-lts)
 - [Deploy the stack](#deploy-the-stack)
+- [Upgrading from 1.0.0](#upgrading-from-100)
 - [Verify the installation](#verify-the-installation)
+- [Authentication and the permission model](#authentication-and-the-permission-model)
 - [Connecting from Drupal](#connecting-from-drupal)
 - [Operations](#operations)
 - [Embedding models for vector search](#embedding-models-for-vector-search)
@@ -40,23 +45,26 @@ ports are exposed.
 
 **Scenario A — Single VPS.** Drupal and Manticore live on the same server.
 Manticore listens only on `127.0.0.1` and is reachable from the local Drupal
-installation as `http://127.0.0.1:9308`. No TLS or authentication is needed
-because the port is not exposed to the network. Best for small blogs and
-wikis (≈ 1k–5k nodes) running on a single host.
+installation as `http://127.0.0.1:9308`. TLS is not needed because the port is
+not exposed to the network, but **credentials are** — the engine authenticates
+every request in every deployment. Best for small blogs and wikis
+(≈ 1k–5k nodes) running on a single host.
 
 The same setup also covers the case where you already run nginx, Apache,
 or any other web server on the host: keep Manticore on `127.0.0.1` and
-add a reverse-proxy block (with TLS and Basic Auth) to your existing web
-server. The Manticore stack itself stays unchanged; only your web server
-config grows by one location block. See the
+add a reverse-proxy block (with TLS) to your existing web server. That
+proxy must **not** authenticate and must **not** strip the `Authorization`
+header — the engine checks credentials itself. The Manticore stack stays
+unchanged; only your web server config grows by one server block. See the
 [Scenario A deployment section](#scenario-a--single-vps) below.
 
 **Scenario B — Dedicated Manticore VPS with public endpoint.** Drupal
 runs on one server, Manticore on a **separate, dedicated** server. The
 bundled Caddy reverse proxy terminates TLS (automatic Let's Encrypt
-certificate) and enforces HTTP Basic Authentication in front of
-Manticore's HTTP API. Manticore itself binds to `127.0.0.1` inside the
-host; only Caddy is publicly reachable, on ports `80` and `443`.
+certificate) in front of Manticore's HTTP API, and forwards the
+`Authorization` header through untouched so the engine can authenticate.
+Manticore itself binds to `127.0.0.1` inside the host; only Caddy is
+publicly reachable, on ports `80` and `443`.
 
 This scenario **requires ports 80 and 443 to be free** on the Manticore
 VPS — nothing else can be listening on them, including any existing
@@ -78,10 +86,15 @@ the Manticore stack does not need to be changed to support it.
 - A VPS with **Ubuntu 24.04 LTS** (other modern Linux distributions will
   work too, but commands in this README are for Ubuntu)
 - **2 GB RAM minimum** for small workloads; 4 GB+ recommended for
-  hundreds of thousands of documents
+  hundreds of thousands of documents. If you use vector search, size for the
+  embedding model instead: loading one peaks at around **1.6 GB** on its own,
+  which makes a 2 GB host marginal. See
+  [Embedding models for vector search](#embedding-models-for-vector-search)
 - **`x86_64` or `arm64`** CPU architecture
-- **Docker Engine 24+** and **Docker Compose plugin v2+**
-  (installation instructions below)
+- **Docker Engine 20.10+** and **Docker Compose plugin v2.1.1+**
+  (installation instructions below). The binding constraint is Compose rather
+  than the Engine, because `./config setup` runs
+  `docker compose up -d --wait`
 - For Scenario B only:
   - a **dedicated VPS** for Manticore (no other web server on it)
   - a **domain or subdomain** with an `A` record pointing to that VPS
@@ -89,6 +102,13 @@ the Manticore stack does not need to be changed to support it.
     open in the firewall — no other service may be listening on them).
     See diagnostics in [Deploy the stack →
     Scenario B](#scenario-b--public-https-endpoint-with-caddy)
+
+> **Why not a newer Docker?** The Compose healthcheck deliberately does not use
+> `start_interval`, so there is **no Engine 25 requirement**. The healthcheck
+> block rejects unknown keys outright, so shipping a newer key would be a hard
+> validation failure on an older Compose — the stack would refuse to start at
+> all — rather than a graceful degrade. On Engine 25 and later the first health
+> probe simply lands sooner.
 
 
 ## Prerequisites: a sudo-capable non-root user
@@ -268,9 +288,8 @@ they are run as a regular user from the `docker` group, without `sudo`.
 
 The stack consists of a single `docker-compose.yml` describing three
 services (`manticore`, `caddy`, and an on-demand `config` helper) plus a
-few supporting files. Clone this repository and start the stack with one
-command — minimal configuration for Scenario A, just four values for
-Scenario B (all managed through the `./config` helper).
+few supporting files. Clone this repository, start the stack, and run the
+setup wizard, which creates the engine credentials both scenarios need.
 
 **1. Clone the repository.**
 
@@ -291,21 +310,25 @@ your user is in the `docker` group, see installation step 8 above).
 
 **2. Pre-configured server options.**
 
-This stack enables one non-default Manticore server option:
-`searchd_not_terms_only_allowed = 1`, set via the
-`searchd_not_terms_only_allowed` environment variable on the `manticore`
-service in `docker-compose.yml`. It allows fulltext queries containing
+This stack enables two non-default Manticore server options, both set via
+environment variables on the `manticore` service in `docker-compose.yml`.
+
+`searchd_not_terms_only_allowed = 1` allows fulltext queries containing
 only negative (NOT) terms — for example, _"show me all documents that
 do NOT mention `obsolete`"_ without a positive term to anchor the
-search.
-
-This option is required by the
+search. This option is required by the
 [Search API Manticore](https://www.drupal.org/project/search_api_manticore)
 Drupal module to support its negation features. If you use the stack
 standalone (without the module), the option is harmless: it relaxes a
 parser constraint without affecting performance.
 
-No action is needed from you — the option is applied automatically the
+`searchd_auth = 1` turns on the engine's built-in authentication. Every
+request on both the HTTP and MySQL protocols then needs credentials — a
+username and password, or a bearer token. Until you run `./config setup`
+the daemon has no accounts at all and answers **every** request with
+HTTP 401; tables load and are intact, they are simply inaccessible.
+
+No action is needed from you — both options are applied automatically the
 first time you start the stack. If you ever edit `docker-compose.yml`
 to tune server options yourself, recreate the container so the new
 values take effect:
@@ -317,6 +340,8 @@ docker compose up -d --force-recreate manticore
 Now choose your scenario:
 
 ### Scenario A — single VPS
+
+**1. Start the stack.**
 
 ```bash
 docker compose up -d
@@ -348,7 +373,34 @@ Note that ports `9306` and `9308` are bound to `127.0.0.1` only — they are
 not reachable from the public network. Port `9312` is the internal Sphinx
 protocol port, not exposed to the host at all.
 
-You can now point your local Drupal site at `http://127.0.0.1:9308`.
+`(healthy)` here means the daemon is alive and serving, not that it is
+configured. The healthcheck probes anonymously and deliberately accepts the
+HTTP 401 that an unauthenticated request gets, because until the wizard has
+run there is no account it could authenticate as.
+
+**2. Create the credentials.**
+
+The daemon is running but has no accounts yet, so it answers every request
+with HTTP 401. Run the setup wizard to bootstrap the engine's admin and
+create the user your Drupal site will authenticate as:
+
+```bash
+./config setup
+```
+
+It asks for a domain and an ACME email even here, where nothing reads them —
+only Caddy does, and Scenario A has no Caddy. Answer them anyway; they cost
+nothing and are already correct if you later switch to Scenario B.
+
+The wizard prints the application user's password **once** at the end. Save
+it immediately — it is not stored in `.env` or anywhere else in this
+repository. See
+[Scenario B](#scenario-b--public-https-endpoint-with-caddy) below for a full
+annotated transcript of the wizard; it is the same wizard in both scenarios.
+
+You can now point your local Drupal site at `http://127.0.0.1:9308`, using
+that username and password. The endpoint requires them — requests without
+credentials return HTTP 401.
 
 #### Exposing Manticore through your existing reverse proxy
 
@@ -365,40 +417,30 @@ HTTPS endpoint for it to reach Manticore. There are two ways to do this:
 
 The Manticore stack stays exactly as in Scenario A — bound to
 `127.0.0.1:9308`, no Caddy, no public ports. Your existing nginx adds
-**one extra `server` block** that terminates TLS, checks Basic Auth, and
-proxies into Manticore on localhost. From Drupal's point of view the
-result is identical to Scenario B.
+**one extra `server` block** that terminates TLS and proxies into
+Manticore on localhost. From Drupal's point of view the result is
+identical to Scenario B.
 
-**Step 1. Generate Basic Auth credentials.**
+> **Your proxy must not authenticate.** The engine checks credentials
+> itself, so the proxy's only jobs are TLS and forwarding. Do **not** add
+> `auth_basic` in front of Manticore: nginx would validate the Drupal
+> module's credential against its own user file and reject it at the
+> proxy, before the engine ever saw it. Do **not** strip or rewrite the
+> `Authorization` header either — that credential is precisely what the
+> engine needs. nginx forwards `Authorization` to the upstream by default,
+> so the correct configuration is simply to leave it alone.
 
-Install `htpasswd` if you don't have it:
-
-```bash
-sudo apt install apache2-utils
-```
-
-Create a credentials file in nginx's config directory:
-
-```bash
-sudo htpasswd -cB /etc/nginx/.htpasswd-manticore drupal
-# Enter a strong password when prompted. Save it — you'll paste it
-# into Drupal's Search API server form later.
-```
-
-The `-B` flag selects bcrypt (the same hash family Scenario B's Caddy
-uses). `-c` creates the file. For subsequent users on the same file,
-omit `-c`.
-
-**Step 2. Add the nginx server block.**
+**Step 1. Add the nginx server block.**
 
 Pick a hostname for the endpoint, for example `search.example.com`, and
 ensure its DNS `A` record points to this VPS. Then create a new file
 `/etc/nginx/sites-available/manticore.conf` with the following content:
 
 ```nginx
-# Manticore Search reverse proxy with Basic Auth and TLS.
+# Manticore Search reverse proxy: TLS termination only.
 # Manticore itself listens on 127.0.0.1:9308 (from the Docker stack);
 # this server block makes it reachable as https://search.example.com.
+# Authentication is enforced by the Manticore engine, not here.
 
 server {
     listen 443 ssl http2;
@@ -416,10 +458,8 @@ server {
     ssl_ciphers         HIGH:!aNULL:!MD5;
     ssl_prefer_server_ciphers off;
 
-    # HTTP Basic Authentication. The realm string is shown by browsers
-    # in the password prompt; the user-file holds bcrypt-hashed creds.
-    auth_basic           "Manticore Search";
-    auth_basic_user_file /etc/nginx/.htpasswd-manticore;
+    # No auth_basic here — the engine authenticates. Adding one would
+    # reject the application's credential at the proxy.
 
     # Proxy everything into the Manticore container.
     location / {
@@ -434,12 +474,11 @@ server {
         # proxy room to forward them without buffering to disk.
         proxy_buffering    off;
         client_max_body_size 64M;
-    }
 
-    # Strip the Authorization header before forwarding to Manticore.
-    # Auth is enforced by nginx; Manticore itself has no auth and should
-    # never see the credentials.
-    proxy_set_header Authorization "";
+        # The Authorization header is deliberately NOT touched. nginx
+        # forwards it to the upstream by default, and the engine needs
+        # it to authenticate the request. Never clear it here.
+    }
 }
 
 # Plain-HTTP redirect to HTTPS. Required for browsers that hit the
@@ -461,7 +500,7 @@ sudo nginx -t                  # validate the configuration
 sudo systemctl reload nginx
 ```
 
-**Step 3. (If needed) Obtain a TLS certificate.**
+**Step 2. (If needed) Obtain a TLS certificate.**
 
 If your existing nginx already uses certbot for other domains:
 
@@ -474,6 +513,16 @@ and reloads nginx. If you use a different ACME client (acme.sh, lego,
 manual ISPmanager workflow, etc.), follow its usual procedure for adding
 a new domain — there's nothing Manticore-specific.
 
+**Step 3. Create the engine credentials.**
+
+If you have not already done so, run the setup wizard on the Manticore
+host. It creates the user your Drupal site authenticates as and prints its
+password once:
+
+```bash
+./config setup
+```
+
 **Step 4. Verify from outside the VPS.**
 
 ```bash
@@ -485,30 +534,33 @@ curl -s -u 'drupal:your-password' https://search.example.com/cli \
      -d 'SHOW STATUS' | head -5
 ```
 
-The `401` response confirms TLS and Basic Auth are active; the table
-confirms Manticore is reachable through the proxy. From Drupal's
-configuration page, fill in:
+The `401` is returned by Manticore itself and forwarded by nginx; it
+confirms both that TLS works and that the engine is enforcing
+authentication. The table confirms Manticore is reachable through the
+proxy and that the credential is accepted. From Drupal's configuration
+page, fill in:
 
 - **Host:** `search.example.com`
 - **Port:** `443`
 - **Path:** (empty)
 - **Use HTTPS:** yes
-- **HTTP Basic Auth username:** `drupal`
-- **HTTP Basic Auth password:** the value you set in Step 1
+- **HTTP Basic Auth username:** the value of `MANTICORE_USERNAME`
+- **HTTP Basic Auth password:** the password the wizard displayed
 
 > **Why not just bind Manticore to `0.0.0.0:9308`?**
-> Manticore has no built-in authentication. Binding it to a public
-> interface — even "temporarily, while I set up nginx" — exposes the
-> database directly to the internet. Automated scrapers index public
-> ports within seconds; databases left exposed this way are routinely
-> wiped or ransom-locked. The 127.0.0.1 binding plus a reverse proxy is
-> the safe pattern; never open 9308 to the public.
+> The engine does authenticate, so this is no longer the only barrier —
+> but a public port is still worth avoiding. It invites credential
+> stuffing against a service with no rate limiting or lockout of its own,
+> and it removes a layer for free. Automated scanners index public ports
+> within seconds. The 127.0.0.1 binding plus a reverse proxy that
+> terminates TLS remains the safe pattern; never open 9308 to the public.
 
 ### Scenario B — public HTTPS endpoint with Caddy
 
 Scenario B adds a Caddy reverse proxy in front of Manticore. Caddy obtains
-a Let's Encrypt TLS certificate automatically and enforces HTTP Basic
-Authentication on every request.
+a Let's Encrypt TLS certificate automatically, terminates TLS, and forwards
+requests to the engine with the `Authorization` header untouched. It holds
+no credentials of its own — the engine authenticates every request.
 
 > **⚠ Prerequisites before you start.**
 >
@@ -545,15 +597,16 @@ around `docker compose run --rm -it config` (see [Configuration helper
 reference](#configuration-helper-reference) below for the full command
 list).
 
-**1. Configure the four required `.env` values.**
+**1. Run the setup wizard.**
 
-The fastest path is the interactive setup wizard:
+The wizard collects three values, bootstraps the engine's admin, creates the
+application user, and shows you that user's password once:
 
 ```bash
 ./config setup
 ```
 
-It walks you through all four values in a single guided flow:
+It asks three questions, then provisions the engine:
 
 ```
 ============================================================
@@ -562,52 +615,111 @@ It walks you through all four values in a single guided flow:
 
 Creating .env from .env.example.
 
-Step 1 of 4 — Domain name
+Step 1 of 3 — Domain name
 The fully-qualified hostname pointing at this VPS, with a public
 DNS A record. Example: search.example.com
+Rules: lowercase letters, digits, hyphens and dots only.
 
 Domain: search.example.com
 
-Step 2 of 4 — ACME email
+Step 2 of 3 — ACME email
 Email address used by Let's Encrypt for renewal notices.
+Rules: standard email form, e.g. admin@example.com.
 
 Email: admin@example.com
 
-Step 3 of 4 — HTTP Basic Auth username
-Username the Drupal application will authenticate as.
+Step 3 of 3 — Application username
+The engine user the Drupal site will authenticate as. It will be
+created with exactly the grants the module needs, and a password
+shown to you once at the end.
+Rules: 1-32 characters, ASCII letters/digits/underscore/hyphen.
 
-Username: drupal
+Username [drupal]: drupal
 
-Step 4 of 4 — HTTP Basic Auth password
-How would you like to set the password?
+Summary
 
-  1) Generate a strong random password (recommended)
-  2) Enter your own password
+  MANTICORE_DOMAIN     = search.example.com
+  MANTICORE_ACME_EMAIL = admin@example.com
+  MANTICORE_USERNAME   = drupal
 
-Choice [1]: 1
+Next, the engine's admin is bootstrapped and the user above is
+created. Nothing has been changed yet.
+
+Write these values to .env and continue? [y/N] y
+
+.env written.
+```
+
+The username offers `drupal` as a default; the domain and email do not offer
+one, because the placeholders in `.env.example` cannot work anywhere and
+offering them would only invite a broken deployment.
+
+Nothing has touched the engine up to this point — aborting here leaves it
+exactly as it was. After you answer `y`, the wizard starts the daemon if it
+is not already running, bootstraps the admin account, and provisions the
+application user:
+
+```
+Starting the manticore service and waiting for it to report healthy.
+This is usually a few seconds, but can take up to 30 on the first
+start or on older Docker versions.
+
+Bootstrapping the engine's admin account...
+Issuing the admin token...
+Admin configured; MANTICORE_ADMIN_TOKEN written to .env.
+
+Application user
+
+Created engine user 'drupal'.
+
+Grants for 'drupal':
+  grant read: granted
+  grant write: granted
+  grant schema: granted
+
+Checking that the engine executes queries...
+Admin credential works.
+```
+
+Finally — and this is the part worth reading — the wizard checks the
+application credential **the way Drupal will use it**: over HTTP Basic,
+against a scratch table it creates and drops. It reports each grant
+separately:
+
+```
+Verifying the application credential (drupal) over HTTP Basic...
+  index a document (/bulk): OK (grant 'write')
+  search (/search): OK (grant 'read')
+  availability probe (SHOW STATUS): OK (grant 'schema')
+
+Setup complete.
 
 ============================================================
-  PASSWORD (save this NOW — it will not be shown again):
+  PASSWORD for 'drupal' (save this NOW — shown only once):
 
       5J.vuTaj9vKvIibUSMMFVn7x
 
 ============================================================
 
-Summary
-
-  MANTICORE_DOMAIN       = search.example.com
-  MANTICORE_ACME_EMAIL   = admin@example.com
-  MANTICORE_USERNAME     = drupal
-  MANTICORE_PASSWORD_HASH= $$2a$$14$$••••••••
-
-Write these values to .env? [y/N] y
-
-Setup complete. .env has been written.
+It is not stored in .env, or anywhere else in this repo.
+Put it straight into the Drupal Key entity your Search API
+server uses, alongside the username 'drupal'.
 ```
 
-**Copy the plaintext password to a password manager before answering `y`.**
-It will not be shown again, and you will need it later when configuring
-the Search API server in Drupal.
+Indexing runs before the search probe so that the read probe has something
+to find. A failing probe prints `FAILED (grant '<name>')` together with the
+daemon's own error, and the password is still shown afterwards — you will
+need it either way.
+
+> **Two similar-looking blocks.** The `grant read: granted` lines report
+> what was **provisioned**; the `search (/search): OK (grant 'read')` lines
+> report what was **verified** against the live credential. They are
+> different checks, and only the second proves the credential works.
+
+**Copy the password to a password manager now.** It is not stored in `.env`
+or anywhere else in this repository, it will not be shown again, and you
+will need it when configuring the Search API server in Drupal. If you lose
+it, issue a new one with `./config password change`.
 
 The domain you enter must have a public DNS `A` record pointing at this
 VPS before you continue — Let's Encrypt will validate ownership by
@@ -615,12 +727,12 @@ sending an HTTP request to
 `http://<your-domain>/.well-known/acme-challenge/...` within seconds of
 starting Caddy.
 
-If you chose option **2** (enter your own password), you will be prompted
-twice with hidden input. The password is **never** accepted as a
-command-line argument — arguments are recorded in shell history, visible
-in `ps auxw` while the command runs, and may end up in SSH session logs.
-For non-interactive deployment (Ansible, CI), ship a pre-populated
-`.env` file via your configuration management tool instead.
+The wizard always generates the application password itself. If you would
+rather choose one, run `./config password change` afterwards and pick
+option **2**; you will be prompted twice with hidden input. A password is
+**never** accepted as a command-line argument — arguments are recorded in
+shell history, visible in `ps auxw` while the command runs, and may end up
+in SSH session logs.
 
 <details>
 <summary>Alternative: configure each value individually</summary>
@@ -631,34 +743,27 @@ one field after the initial setup), use the individual subcommands:
 ```bash
 ./config domain   search.example.com
 ./config email    admin@example.com
-./config username drupal
-./config password generate          # random password + hash
-./config password change            # prompt for password interactively
+./config username drupal            # creates the user in the engine
+./config password change            # new password for the application user
 ```
 
 Each command shows a preview of the planned change and asks for
 confirmation. The `.env` file is created automatically from
 `.env.example` the first time you run any of them.
 
+Note that these do not replace `./config setup` on a fresh install: the
+engine's admin has to be bootstrapped before any of them can talk to it.
+
 </details>
 
-> **Why are there `$$` in the hash?** Compose interpolates values loaded
-> from `.env` when substituting them into `docker-compose.yml`. A bcrypt
-> hash like `$2a$14$XXXX` would be mis-parsed: Compose would try to expand
-> `$2a`, `$14`, and `$XXXX` as variable references. Doubling each `$`
-> escapes the interpolation; Compose strips one `$` from each pair when
-> passing the value to Caddy, which then sees the correct single-`$` hash.
-> The `./config` commands handle this for you; never edit
-> `MANTICORE_PASSWORD_HASH` by hand.
-
-**2. Verify `.env` is complete.**
+**2. Verify the configuration.**
 
 ```bash
 ./config show
 ```
 
-You should see all four values populated, with the password hash masked
-for safety:
+This prints the `.env` values — with the admin token masked — followed by
+the engine's own users and their grants:
 
 ```
 Current configuration (.env)
@@ -666,10 +771,36 @@ Current configuration (.env)
   MANTICORE_DOMAIN       = search.example.com
   MANTICORE_ACME_EMAIL   = admin@example.com
   MANTICORE_USERNAME     = drupal
-  MANTICORE_PASSWORD_HASH= $$2a$$14$$••••••••
+  MANTICORE_ADMIN_TOKEN  = a1b2c3...
+
+  The application user's password is not stored here.
+  Issue a new one with './config password change'.
+
+Engine users and grants
+
+  admin
+      read on *
+      write on *
+      schema on *
+      replication on *
+      admin on *
+  drupal
+      read on *
+      write on *
+      schema on *
+
+  Internal (system.*) accounts are deliberately not listed.
 ```
 
+The contrast is the point: the admin holds all five grants, and the
+application user deliberately holds three of them. See
+[Authentication and the permission model](#authentication-and-the-permission-model)
+for why those three and no others.
+
 **3. Start the stack with the `public` profile.**
+
+The wizard already started the `manticore` service in order to bootstrap it,
+but it does not start Caddy on a fresh install. Bring up the full stack:
 
 ```bash
 docker compose --profile public up -d
@@ -686,6 +817,10 @@ Expected output:
 
 Caddy starts after Manticore reaches the `healthy` state, thanks to a
 `depends_on` directive — typically about 5-7 seconds.
+
+If Caddy was **already running** when you ran the wizard — for example when
+re-running it to change the domain — you do not need this step: the wrapper
+recreates Caddy for you as the wizard exits, so it picks up the new values.
 
 **4. Watch the Caddy logs while it obtains the certificate.**
 
@@ -715,6 +850,68 @@ the endpoint is ready.
 Press `Ctrl+C` to stop following the log; the container continues running.
 
 
+## Upgrading from 1.0.0
+
+In 1.0.0 authentication was enforced by the Caddy reverse proxy, using a
+bcrypt hash in `.env`. In 2.0.0 the Manticore engine authenticates itself, on
+both protocols, in **both** scenarios. Caddy keeps doing TLS and nothing
+else.
+
+**Indexed data is not affected.** Enabling authentication over a populated
+volume loads every table normally, and credentials survive a container
+recreate.
+
+The upgrade is the same command in both scenarios:
+
+```bash
+git pull
+docker compose up -d manticore     # recreates it with searchd_auth=1
+./config setup
+```
+
+Run them in that order: the admin bootstrap is a local `searchd` call, so it
+needs a running daemon. (`./config setup` will start the daemon itself if you
+forget, so this is belt-and-braces rather than strictly required — but the
+explicit `up -d` is what recreates the container with the new setting.)
+
+For Scenario B, finish by recreating Caddy so it picks up the new Caddyfile:
+
+```bash
+docker compose --profile public up -d --force-recreate caddy
+```
+
+If Caddy was already running when you ran the wizard, `./config` does this
+for you as the wizard exits.
+
+The wizard detects which upgrade you are in the middle of and prints the
+matching notice before it changes anything.
+
+### Scenario B — you had Caddy Basic Auth
+
+- `MANTICORE_PASSWORD_HASH` is dead. Nothing reads it, and the wizard removes
+  it from `.env`.
+- The application user is created **in the engine**, with a new password
+  shown to you once.
+- On the Drupal side the connector keeps exactly the same shape — URL,
+  username, and a Key entity holding the password. **Only the value inside
+  the Key entity changes.** No code change is required.
+
+### Scenario A — you had no credentials at all
+
+This is the one that can surprise you. Scenario A had no authentication in
+1.0.0, and now has it.
+
+- Requests that used to succeed anonymously now return **HTTP 401**.
+- Your Drupal connector needs a username and a Key entity holding a password
+  **for the first time**.
+- Anything else pointed at `127.0.0.1:9308` — scripts, cron jobs, monitoring
+  — needs credentials too.
+
+If your reverse proxy strips the `Authorization` header, requests will fail
+with 401 no matter what credentials you supply; see
+[Every request returns 401 despite correct credentials](#every-request-returns-401-despite-correct-credentials).
+
+
 ## Verify the installation
 
 Manticore exposes a simple JSON over HTTP API on port 9308. The smoke tests
@@ -722,12 +919,19 @@ below confirm the stack is fully functional in your chosen scenario.
 
 ### Scenario A — local access
 
-Run these on the same VPS as Manticore:
+Run these on the same VPS as Manticore. Every request needs credentials —
+the engine authenticates on the loopback interface exactly as it does
+through a proxy. Substitute the username from `.env` and the password the
+wizard displayed:
+
+```bash
+export MC_AUTH='drupal:your-password'
+```
 
 **1. Server status and version.**
 
 ```bash
-curl -s http://127.0.0.1:9308/cli -d 'SHOW VERSION'
+curl -s -u "$MC_AUTH" http://127.0.0.1:9308/cli -d 'SHOW VERSION'
 ```
 
 ```
@@ -750,15 +954,15 @@ and embeddings — all extension modules are loaded by default.
 
 ```bash
 # Create a real-time table with two text fields and one integer attribute.
-curl -s http://127.0.0.1:9308/cli \
+curl -s -u "$MC_AUTH" http://127.0.0.1:9308/cli \
   -d 'CREATE TABLE testrt (title text, content text, gid integer)'
 
 # Insert three documents.
-curl -s http://127.0.0.1:9308/insert \
+curl -s -u "$MC_AUTH" http://127.0.0.1:9308/insert \
   -d '{"index":"testrt","id":1,"doc":{"title":"Hello world","content":"Manticore search test","gid":1}}'
-curl -s http://127.0.0.1:9308/insert \
+curl -s -u "$MC_AUTH" http://127.0.0.1:9308/insert \
   -d '{"index":"testrt","id":2,"doc":{"title":"Drupal CMS","content":"Headless and decoupled architecture","gid":2}}'
-curl -s http://127.0.0.1:9308/insert \
+curl -s -u "$MC_AUTH" http://127.0.0.1:9308/insert \
   -d '{"index":"testrt","id":3,"doc":{"title":"Search API","content":"Drupal module for unified search","gid":2}}'
 ```
 
@@ -768,11 +972,11 @@ Each insert returns `{"table":"testrt","id":N,"created":true,"result":"created",
 
 ```bash
 # Match "hello" — expect one hit, document #1.
-curl -s http://127.0.0.1:9308/search \
+curl -s -u "$MC_AUTH" http://127.0.0.1:9308/search \
   -d '{"index":"testrt","query":{"match":{"*":"hello"}}}'
 
 # Match "drupal" — expect two hits, documents #2 and #3.
-curl -s http://127.0.0.1:9308/search \
+curl -s -u "$MC_AUTH" http://127.0.0.1:9308/search \
   -d '{"index":"testrt","query":{"match":{"*":"drupal"}}}'
 ```
 
@@ -796,14 +1000,14 @@ Sample response (formatted for readability):
 **4. Count and clean up.**
 
 ```bash
-curl -s http://127.0.0.1:9308/cli -d 'SELECT COUNT(*) FROM testrt'
+curl -s -u "$MC_AUTH" http://127.0.0.1:9308/cli -d 'SELECT COUNT(*) FROM testrt'
 # +----------+
 # | count(*) |
 # +----------+
 # | 3        |
 # +----------+
 
-curl -s http://127.0.0.1:9308/cli -d 'DROP TABLE testrt'
+curl -s -u "$MC_AUTH" http://127.0.0.1:9308/cli -d 'DROP TABLE testrt'
 # Query OK, 0 rows affected
 ```
 
@@ -825,10 +1029,11 @@ curl: (7) Failed to connect to <your-public-ip> port 9308: Couldn't connect to s
 ```
 
 This is the **correct** behaviour for Scenario A. If you can reach Manticore
-through the public IP, your binding is wrong (likely a misconfigured port
-mapping in `docker-compose.yml`) and your Manticore is open to the world
-without authentication — **stop the stack immediately and fix it before
-exposing the host further**.
+through the public IP, your binding is wrong — likely a misconfigured port
+mapping in `docker-compose.yml`. The engine will still demand credentials,
+so this is not an immediate breach the way it was before authentication
+moved into the daemon, but it exposes the service to anyone who wants to
+guess at them. **Fix it before exposing the host further.**
 
 ### Scenario B — public HTTPS access
 
@@ -843,14 +1048,18 @@ curl -sI https://search.example.com/cli
 
 ```
 HTTP/2 401
-www-authenticate: Basic realm="restricted"
+www-authenticate: Basic realm="Manticore daemon", charset="UTF-8"
 server: Caddy
 alt-svc: h3=":443"; ma=2592000
 ```
 
-`HTTP/2` (rather than `HTTP/1.1`) means TLS is correctly negotiated;
+`HTTP/2` (rather than `HTTP/1.1`) means TLS is correctly negotiated, and
 `Caddy` in the `server` header confirms the reverse proxy is handling the
-request; `www-authenticate: Basic` shows the auth challenge is active.
+request. The `www-authenticate` challenge is **Manticore's own** — the realm
+`Manticore daemon` is emitted by the engine and passed back through Caddy
+untouched. Seeing it proves the whole chain: TLS terminated at the proxy,
+the request forwarded to the daemon, and the daemon enforcing
+authentication.
 
 **2. With correct credentials — expect a Manticore status table.**
 
@@ -903,6 +1112,71 @@ Caddy will renew this certificate automatically when ~30 days remain
 before expiry.
 
 
+## Authentication and the permission model
+
+Manticore 27.1.5 authenticates natively, on both the HTTP and MySQL
+protocols. A reverse proxy in front of it — the bundled Caddy, or your own
+nginx — terminates TLS and forwards the `Authorization` header; it holds no
+credentials and checks none.
+
+### Two credentials, deliberately different in kind
+
+| | Application user | Admin token |
+|---|---|---|
+| Where it lives | a Drupal Key entity | `MANTICORE_ADMIN_TOKEN` in `.env` |
+| Form | username + password, sent as HTTP Basic | bearer token |
+| Scope | `read`, `write`, `schema` | root-equivalent for the engine |
+| Used by | the Drupal module | `./config` |
+| Rotate with | `./config password change` | `./config token rotate` |
+
+The application user's password is generated by the wizard, **displayed
+once, and stored nowhere in this repository**. The admin token is written to
+`.env`, which `./config` forces to mode `600` whenever it writes to it.
+
+The admin password itself is never stored at all — it exists only during the
+bootstrap and is discarded. That is why a lost admin token cannot be
+recovered, only reset; see
+[I lost the admin token](#i-lost-the-admin-token).
+
+### Why the application user gets exactly three grants
+
+The wizard issues these and nothing else:
+
+```sql
+GRANT read ON * TO 'drupal';
+GRANT write ON * TO 'drupal';
+GRANT schema ON * TO 'drupal';
+```
+
+Each one is forced by something specific the Drupal module does:
+
+- **`read`** — `POST /search`. Also covers `DESCRIBE` and
+  `SHOW CREATE TABLE`.
+- **`write`** — `POST /bulk`, which is how the module indexes. **`TRUNCATE
+  TABLE` also lives under `write`**, not under `schema`, so a user with
+  `write` but no `schema` can still empty an index — which is what Search
+  API's "clear index" does.
+- **`schema`** — `CREATE`, `DROP` and `ALTER TABLE`, and **`SHOW STATUS`**.
+
+`schema` is the one that surprises people. `SHOW STATUS` is the module's
+availability probe, so a search-only site still needs it: without `schema`
+the module reports the backend as **down** while search and indexing in fact
+work perfectly.
+
+**`admin` and `replication` are never granted.** The admin account holds all
+five, which is why `./config show` lists it with more than the application
+user.
+
+Grants attach to the *user*, not to the credential, so they are unaffected by
+how the user authenticates.
+
+> **A note on tokens.** `CREATE USER` mints a bearer token for the new user
+> whether or not one is asked for, so the application user has one from the
+> moment it exists. The wizard deliberately discards it: the Drupal module
+> can only send HTTP Basic today, so a token it cannot use is a credential
+> with nowhere safe to live.
+
+
 ## Connecting from Drupal
 
 Once the stack is running, install the
@@ -910,13 +1184,19 @@ Once the stack is running, install the
 module on your Drupal site, then add a new Search API server pointing at
 this Manticore instance.
 
+The connector takes the same three things in every deployment: a URL, a
+username, and a Key entity holding the password. Only the host, port and
+TLS setting differ between scenarios.
+
 **Scenario A — Drupal and Manticore on the same VPS:**
 
 - Backend: `Manticore Search`
 - Host: `127.0.0.1`
 - Port: `9308`
 - HTTPS: disabled
-- Authentication: none
+- Authentication: HTTP Basic Auth
+- Username: the value of `MANTICORE_USERNAME` from your `.env`
+- Password: the password the wizard displayed, held in a Key entity
 
 **Scenario B — Drupal on a separate VPS:**
 
@@ -926,8 +1206,7 @@ this Manticore instance.
 - HTTPS: enabled
 - Authentication: HTTP Basic Auth
 - Username: the value of `MANTICORE_USERNAME` from your `.env`
-- Password: the plaintext password whose bcrypt hash is in
-  `MANTICORE_PASSWORD_HASH`
+- Password: the password the wizard displayed, held in a Key entity
 
 **Scenario A behind your own reverse proxy — Drupal anywhere:**
 
@@ -937,8 +1216,12 @@ this Manticore instance.
 - Port: `443`
 - HTTPS: enabled
 - Authentication: HTTP Basic Auth
-- Username: the username you passed to `htpasswd` (e.g. `drupal`)
-- Password: the password you set when creating the htpasswd entry
+- Username: the value of `MANTICORE_USERNAME` from your `.env`
+- Password: the password the wizard displayed, held in a Key entity
+
+The credential is the same in all three cases because it is checked in the
+same place in all three cases — the engine. The proxy, where there is one,
+only forwards it.
 
 Refer to the module's documentation for the exact form field names and any
 additional options.
@@ -1008,34 +1291,61 @@ docker inspect manticore --format '{{json .State.Health}}' | python3 -m json.too
 and debugging — uses the always-present `mysql` client):
 
 ```bash
-docker exec -it manticore mysql
+docker exec -it manticore mysql -u drupal -p
 ```
 
-From the prompt you can run any Manticore SQL: `SHOW TABLES`, `SELECT *
-FROM <table>`, `OPTIMIZE`, `FLUSH RAMCHUNK`, etc.
+The MySQL protocol is authenticated as well as the HTTP one, so log in as a
+user the engine knows and enter its password at the prompt. From there you
+can run any Manticore SQL: `SHOW TABLES`, `SELECT * FROM <table>`,
+`OPTIMIZE`, `FLUSH RAMCHUNK`, etc., subject to that user's grants.
 
-**Manage configuration** (`.env` values):
+A wrong password is refused like this:
+
+```
+ERROR 1045 (42000): Access denied for user 'drupal' (using password: YES)
+```
+
+The application user holds `read`, `write` and `schema` but not `admin`, so
+administrative statements are refused too — and this is the part worth
+noting, because it returns the **same error number**:
+
+```
+ERROR 1045 (42000) at line 1: Permission denied for user 'drupal'
+```
+
+Over the MySQL protocol, `ERROR 1045` therefore cannot tell you whether the
+credential is wrong or the grant is missing. Only the message text
+distinguishes them: *Access denied* is a bad credential, *Permission denied*
+is a valid credential without the required grant. The HTTP API keeps the two
+apart properly, as `401` and `403`.
+
+**Manage configuration and credentials:**
 
 ```bash
-./config show                         # see current settings
-./config password generate            # rotate the Basic Auth password
-./config domain   search.new.com      # change domain (will need to re-issue cert)
+./config show                         # .env values, plus engine users and grants
+./config check                        # authenticated query against the engine
+./config password change              # new password for the application user
+./config token rotate                 # new admin token
+./config domain   search.example.com  # change domain (will need to re-issue cert)
 ```
 
-After changing any value used by Caddy (domain, email, username, or
-password), recreate the Caddy container so it picks up the new value:
+After changing a value that Caddy reads (domain or email), recreate the
+Caddy container so it picks up the new value. `./config` does this for you
+automatically when Caddy is running; to do it by hand:
 
 ```bash
 docker compose --profile public up -d --force-recreate caddy
 ```
+
+Credential changes need no recreate at all — Caddy holds no credentials.
 
 See [Configuration helper reference](#configuration-helper-reference)
 for the full list of subcommands.
 
 **Upgrade Manticore** to a new minor or patch version:
 
-1. Update the `image:` line in `docker-compose.yml` (e.g. `25.0.1` →
-   `25.0.2`).
+1. Update the `image:` line in `docker-compose.yml` (e.g. `27.1.5` →
+   `27.1.6`).
 2. Pull the new image and recreate the container:
 
    ```bash
@@ -1045,6 +1355,10 @@ for the full list of subcommands.
 
 3. Verify with `docker compose logs manticore --tail=20` that the new
    version is running.
+
+Recreating the container does not disturb authentication: users, grants and
+tokens live in `auth.json` inside the `manticore-data` volume, and survive
+`up -d --force-recreate` untouched.
 
 **Back up your data.** Manticore's data lives in the `manticore-data`
 Docker named volume. To get its location on the host:
@@ -1103,8 +1417,53 @@ created, the engine downloads that model from the internet and caches it
 inside its data volume, under `/var/lib/manticore/.cache`. On a normal
 internet-connected host this is automatic and needs no preparation.
 
-Two situations need manual steps: a host with no outbound internet, and a
-container started with no network at all.
+Which model to use is the Drupal module's decision — it supplies the model
+name. What follows is what running one **costs on this stack**, so you can
+size a host and avoid one specific surprise.
+
+### `CREATE TABLE` is what blocks, not the first `INSERT`
+
+This is the most useful operational fact in this section. The model download
+happens during the `CREATE TABLE` that first names the model — not on the
+first document you index. Measured on a cold cache, a
+several-hundred-megabyte model took **around 50 seconds** to create the
+table, against **under a second** for a single-row insert afterwards.
+
+That matters because index creation from Drupal is a synchronous HTTP
+request. A cold-cache `CREATE TABLE` can therefore exceed a typical PHP or
+web-server timeout (commonly 30–60 seconds), and the operator sees a failed
+request rather than a slow but successful one. Pre-warming the cache — by
+creating a throwaway table that names the model, from the command line —
+avoids it entirely. The cache is per-model, so this is a one-off per model.
+
+### Sizing the host
+
+For a multilingual model, measured on this stack:
+
+- **about 465 MB** on disk, inside the `manticore-data` volume
+- **about 1.6 GB** peak container memory while the model loads
+
+The memory peak is the number to size by. It occurs during model load and
+bulk indexing never exceeded it. Smaller models cost proportionally less.
+Note that 1.6 GB on its own makes a 2 GB host marginal — see
+[Requirements](#requirements).
+
+### The cache persists
+
+The cache lives inside the existing `manticore-data` volume, so it survives
+`docker compose down` and `docker compose up -d --force-recreate` with no
+re-download. **No additional volume and no Compose change are needed** for
+embeddings to work or for the cache to persist.
+
+### Verify a model before relying on it
+
+Create a throwaway table that names the model and drop it again, before
+pointing a real index at it. A published model repository can download
+completely and still fail at load, and the failure surfaces only when the
+table is created.
+
+Two further situations need manual steps: a host with no outbound internet,
+and a container started with no network at all.
 
 ### Pre-populate the model cache (air-gapped host)
 
@@ -1182,12 +1541,32 @@ does not use it.
 
 ## Configuration helper reference
 
-The `./config` wrapper provides a single entrypoint for managing the
-`.env` file. Every subcommand validates input, shows a diff of the
-planned change, asks for confirmation, and restores host file ownership
-afterwards. The actual logic lives in `bin/config.sh`; the wrapper just
-forwards arguments to `docker compose run --rm -it config <args>` with
-the right Compose flags.
+The `./config` wrapper is a single entrypoint for managing both the `.env`
+file and the engine's own users, tokens and grants. Every subcommand
+validates input, shows a diff of the planned change where one applies, asks
+for confirmation, and restores host file ownership afterwards — `.env` is
+forced to mode `600` whenever it is written.
+
+Most of the logic lives in `bin/config.sh` and runs in a throwaway container;
+the wrapper forwards to `docker compose run --rm -it config <args>`. A few
+operations must run on the host instead, because they are local `searchd`
+calls with no network equivalent — the admin bootstrap in `setup`, and
+`admin reset`. Always invoke through `./config` rather than calling the
+compose service directly.
+
+There are no flags; every argument is positional.
+
+```
+setup                         Interactive wizard for first-time config
+show                          Display .env plus the engine's users/grants
+check                         Authenticated query against the engine
+domain <fqdn>                 Set MANTICORE_DOMAIN
+email <addr>                  Set MANTICORE_ACME_EMAIL
+username <name>               Set MANTICORE_USERNAME and create the user
+password change               New password for the application user
+token rotate                  New admin token in .env
+admin reset                   Wipe all engine users and start again
+```
 
 **Inspect current configuration:**
 
@@ -1195,7 +1574,23 @@ the right Compose flags.
 ./config show
 ```
 
-Displays all four `.env` values; the password hash is masked.
+Displays the four `.env` values with the admin token masked to its first few
+characters, then queries the engine and lists its users with their grants.
+Internal `system.*` accounts are deliberately filtered out. If the stack is
+stopped or the token is missing it says so and still prints the `.env` half —
+that is exactly the situation you would run it to diagnose.
+
+**Check that the engine is reachable and the token works:**
+
+```bash
+./config check
+```
+
+Runs an authenticated `SELECT 1` against the engine using
+`MANTICORE_ADMIN_TOKEN`. It verifies the **admin** credential only; the
+application user's password is not stored anywhere, so it cannot be checked
+after the fact — `./config password change` verifies a new one at the moment
+it is issued.
 
 **Set domain, email, or username:**
 
@@ -1216,26 +1611,58 @@ Each command validates its argument:
 Invalid input is rejected without changing `.env`. If the new value is
 identical to the current one, the command reports `No change` and exits.
 
-**Manage the Basic Auth password:**
+`domain` and `email` only touch `.env`, and recreate Caddy afterwards if it
+is running. **`username` does more than that: it creates the user in the
+engine** and grants it `read`, `write` and `schema`.
 
-```bash
-./config password generate            # random 24-char password + hash
-./config password change              # prompts for password interactively
+The engine has **no rename**. Pointing `MANTICORE_USERNAME` at a new name
+therefore creates a *new* user with a *new* password, which means updating
+the Drupal Key entity as well. The old user is not removed automatically —
+`./config username` offers to drop it, and if you decline it keeps working
+until you drop it by hand:
+
+```sql
+DROP USER 'old-name';
 ```
 
-The `generate` form prints the plaintext password once in a clearly
-framed block — **save it immediately**; it is not stored anywhere on
-disk in cleartext.
+**Change the application user's password:**
 
-The `change` form prompts for the password twice (input is hidden via
-`stty -echo`), with a confirmation step that re-prompts on mismatch.
-The password is **never** accepted as a command-line argument because
-arguments are recorded in shell history, visible in `ps auxw` during
-execution, and may end up in SSH session logs. For non-interactive
-deployment, ship a pre-populated `.env` via Ansible/Puppet/etc. instead.
+```bash
+./config password change              # prompts interactively
+```
 
-Both commands write the bcrypt hash to `MANTICORE_PASSWORD_HASH` in
-`.env` with the required `$$` escaping for Compose interpolation.
+Offers a generated 24-character password or one you type yourself (hidden
+input via `stty -echo`, entered twice, re-prompting on mismatch). It sets the
+password **in the engine**, verifies the new credential over HTTP Basic
+immediately, and displays it once.
+
+The password is **never** accepted as a command-line argument, and the
+command refuses outright if given one — arguments are recorded in shell
+history, visible in `ps auxw` during execution, and may end up in SSH session
+logs.
+
+Nothing is written to `.env`: the application password is not stored there,
+or anywhere else in this repository. It belongs in a Drupal Key entity.
+
+**Rotate the admin token:**
+
+```bash
+./config token rotate
+```
+
+Issues a new `MANTICORE_ADMIN_TOKEN`, writes it to `.env`, and confirms it
+authenticates. **The previous token stops working immediately**, so anything
+else configured with it must be updated. Caddy holds no credentials, so
+nothing needs recreating.
+
+**Reset the engine's authentication:**
+
+```bash
+./config admin reset
+```
+
+Destructive recovery for a lost admin token — see
+[I lost the admin token](#i-lost-the-admin-token).
 
 **Interactive setup wizard:**
 
@@ -1243,11 +1670,16 @@ Both commands write the bcrypt hash to `MANTICORE_PASSWORD_HASH` in
 ./config setup
 ```
 
-Walks you through all four values in a single guided flow — recommended
-for first-time deployment. If `.env` already exists and is fully
-populated, the wizard asks before overwriting. The password step lets
-you choose between auto-generated and manually entered (with confirmed
-input).
+Collects three values (domain, ACME email, application username), bootstraps
+the engine's admin, creates the application user with its grants, verifies
+that credential, and displays its password once. Recommended for first-time
+deployment, and re-runnable afterwards.
+
+Collection happens before anything else, so aborting during the questions
+leaves the engine untouched. If `.env` already exists and is fully populated,
+the wizard asks before overwriting. If the engine already has an admin and
+the token in `.env` still works, the bootstrap is skipped and it continues
+with the application user.
 
 **Help:**
 
@@ -1305,29 +1737,35 @@ the `docker-compose.yml` was edited:
 docker compose up -d --force-recreate manticore
 ```
 
-### `WARN` about an unset variable found inside a value
+### Every request returns 401 despite correct credentials
 
-When running any `docker compose` command you see:
+First, confirm the credentials are actually correct — reissue them with
+`./config password change`, which verifies the new credential as it is
+issued.
 
+If they are correct and requests still fail, the most likely cause is a
+reverse proxy that **removes or rewrites the `Authorization` header** before
+the request reaches Manticore. The engine then sees an anonymous request and
+can only answer 401 — even though the client did send a credential.
+
+In nginx, look for this directive and delete it:
+
+```nginx
+proxy_set_header Authorization "";
 ```
-WARN[0000] The "xyz" variable is not set. Defaulting to a blank string.
-```
 
-— Compose is trying to interpolate a `$xyz...` substring it found inside
-one of your `.env` values. This almost always means
-`MANTICORE_PASSWORD_HASH` was written without the required `$$` escaping
-(typically by editing `.env` by hand with single dollars). Regenerate it
-using the bundled helper, which writes the value correctly:
+Under 1.0.0 that line was correct: the proxy authenticated, and Manticore had
+no authentication of its own to feed. Under 2.0.0 it is fatal. If you copied
+an older recipe into your own vhost, this is the line to remove. nginx
+forwards `Authorization` to the upstream by default, so no replacement
+directive is needed.
 
-```bash
-./config password generate
-```
+Check too that the proxy is not enforcing its own `auth_basic` in front of
+Manticore. It would reject the application's credential at the proxy, before
+the engine ever saw it.
 
-If the stack is running, the wrapper will also recreate Caddy
-automatically so it picks up the corrected value. After the fix,
-`MANTICORE_PASSWORD_HASH` in `.env` should start with `$$2a$$` or
-`$$2b$$` (doubled dollars), and there should be no WARN messages on
-subsequent commands.
+A blanket 401 immediately after upgrading usually means something simpler:
+`./config setup` has not been run yet, so the engine has no accounts at all.
 
 ### `./config` prompts don't respond to `y` at the confirmation step
 
@@ -1336,11 +1774,14 @@ invoking the underlying Compose service directly (without the wrapper),
 make sure to pass both flags:
 
 ```bash
-docker compose run --rm -it config password generate
+docker compose run --rm -it config password change
 ```
 
 Without `-it`, Compose may not allocate a TTY, and `read` silently
 treats the prompt as cancelled.
+
+Note that `setup` and `admin reset` cannot be run this way at all — they
+need the host wrapper, and refuse to run without it.
 
 ### `docker compose config --services` does not list `caddy` or `config`
 
@@ -1355,29 +1796,27 @@ This is documented Compose behaviour, not a bug. Helper commands like
 `docker compose run --rm <service>` activate the matching profile
 automatically.
 
-### Caddy still rejects new credentials after changing `.env`
+### Caddy still serves the old domain or certificate after changing `.env`
 
-You changed the password (or username, or domain) via `./config`, but
-Caddy still responds with `401 Unauthorized` to the new credentials.
-This is expected — Docker container environment variables are fixed at
-container creation time and are not re-read when `.env` changes. You
-need to recreate the Caddy container to pick up the new value:
+You changed `MANTICORE_DOMAIN` or `MANTICORE_ACME_EMAIL`, but Caddy is still
+serving the previous domain. This is expected — Docker container environment
+variables are fixed at container creation time and are not re-read when
+`.env` changes. Recreate the Caddy container to pick up the new values:
 
 ```bash
 docker compose --profile public up -d --force-recreate caddy
 ```
 
-The Manticore container does not need recreation; only Caddy depends on
-the `.env` values. Verify the new value reached Caddy:
+The Manticore container does not need recreating; those two values are the
+only ones Caddy reads. Verify what actually reached it:
 
 ```bash
-docker exec manticore-caddy printenv MANTICORE_PASSWORD_HASH
+docker exec manticore-caddy printenv MANTICORE_DOMAIN
 ```
 
-This must show a hash with **single** dollars (`$2a$14$...`), not double
-(`$$2a$$...`). The doubling only exists in `.env` to survive Compose
-interpolation; by the time the value reaches Caddy, it has been
-de-doubled.
+**Credential changes never require this.** Caddy holds no credentials — the
+engine checks them — so a new password or a rotated token takes effect
+immediately with no restart anywhere.
 
 > When you use `./config` through the wrapper, this recreate happens
 > automatically — the wrapper detects that `.env` changed and a Caddy
@@ -1385,6 +1824,11 @@ de-doubled.
 > you. This entry covers the case where you edited `.env` outside the
 > helper (manually, via Ansible playbook, etc.), or invoked the
 > in-container `config` service directly without the wrapper.
+>
+> If a wizard run fails partway through, it tells you that `.env` was
+> updated while Caddy is still running with the previous values, and gives
+> you the recreate command — it deliberately does not swap the certificate
+> the proxy is serving while you are still fixing the problem.
 
 ### Caddy fails to obtain a Let's Encrypt certificate
 
@@ -1442,23 +1886,104 @@ The `-v` flag tells Compose to also delete named volumes — both
 Manticore's data and Caddy's TLS certificates will be gone, and a fresh
 `up -d` starts with an empty Manticore and a new ACME registration.
 
-### I forgot the Basic Auth password
+### I lost the application user's password
 
-The bcrypt hash in `.env` is one-way; the plaintext cannot be recovered.
-Generate a new one:
+The engine stores it hashed, so it cannot be recovered — but reissuing it is
+routine and non-destructive:
 
 ```bash
-./config password generate
+./config password change
 ```
 
-The helper writes the new hash to `.env`, prints the plaintext password
-once, and — if the stack is running — silently recreates Caddy so the
-new credentials take effect immediately. No `down`/`up` cycle needed.
-**Copy the plaintext password to a password manager before pressing
-Enter to dismiss the output** — it will not be shown again.
+This sets a new password on the existing user in the engine, verifies it over
+HTTP Basic straight away, and prints it once. Grants, tokens and indexed data
+are untouched. **Copy the password to a password manager before dismissing
+the output** — it will not be shown again.
 
-Don't forget to update the Drupal Search API server configuration with
-the new password afterwards.
+Then update the Drupal Key entity holding the password. Indexing and search
+fail between the change and that update, so do them together.
+
+### I lost the admin token
+
+> **Read this before running anything.** The recovery below **destroys every
+> user, token and grant in the engine**. Your indexed data is *not* touched,
+> but the application user must be recreated and Drupal's Key entity updated
+> with its new password. Use it only when the admin token is genuinely lost.
+
+`MANTICORE_ADMIN_TOKEN` cannot be recovered, and neither can the admin
+password — it is never stored. If you have the token recorded somewhere else,
+put it back into `.env` as `MANTICORE_ADMIN_TOKEN` and re-run
+`./config setup` instead of doing any of this.
+
+Otherwise:
+
+1. Reset the engine's authentication:
+
+   ```bash
+   ./config admin reset
+   ```
+
+2. Confirm by typing the word `reset` when prompted. Anything else aborts
+   without changing a thing.
+
+3. The command empties the engine's authentication file, bootstraps a new
+   admin, and writes a fresh `MANTICORE_ADMIN_TOKEN` to `.env`. **No restart
+   is needed.**
+
+4. Recreate the application user and get a new password for it:
+
+   ```bash
+   ./config setup
+   ```
+
+5. Update the Drupal Key entity with the password from step 4.
+
+Verify with `./config check`, which runs an authenticated query using the new
+token.
+
+### `/autocomplete` returns HTTP 501 `no such table`
+
+```
+HTTP 501 {"error":"no such table 'my_index'"}
+```
+
+The table exists. This is a **missing `read` grant**, misreported as a schema
+error: the endpoint is resolved under the calling user's identity, and the
+permission failure surfaces as a lookup failure. Chasing it as an indexing or
+naming problem will waste your time.
+
+Check the user's grants:
+
+```bash
+./config show
+```
+
+The application user should have `read`, `write` and `schema` on `*`. If any
+are missing, re-run `./config setup`, which re-applies whichever grants are
+absent without disturbing the rest.
+
+### A 401 does not always mean a bad password
+
+On the HTTP API, the two failures are normally distinct: **401** is an
+authentication failure (wrong or missing credential) and **403** is an
+authorisation failure (valid credential, missing grant). The wizard's own
+probes report them that way.
+
+There is at least one exception. The explicit
+`SET PASSWORD '<new>' FOR '<user>'` form is refused with **401** and an
+authentication-shaped message rather than 403 — and it does this even when
+the target is the caller's own account, while the bare `SET PASSWORD '<new>'`
+form succeeds. So a 401 does not prove the credential is wrong; it can also
+mean the credential is fine and the operation is not allowed. Scripts that
+branch on 401 to mean "re-authenticate" will loop on it.
+
+Over the **MySQL protocol** the distinction collapses entirely: both come
+back as `ERROR 1045`, and only the message text tells them apart —
+`Access denied` for a bad credential, `Permission denied` for a missing
+grant.
+
+If a credential fails everywhere rather than on one operation, see
+[Every request returns 401 despite correct credentials](#every-request-returns-401-despite-correct-credentials).
 
 
 ## License
