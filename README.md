@@ -1360,6 +1360,140 @@ Recreating the container does not disturb authentication: users, grants and
 tokens live in `auth.json` inside the `manticore-data` volume, and survive
 `up -d --force-recreate` untouched.
 
+### Renaming the data volume to match the pinned project name
+
+`docker-compose.yml` pins the Compose project name:
+
+```yaml
+name: manticore-docker
+```
+
+Without that key, Compose derives the project name from the directory holding
+`docker-compose.yml`, so a deployment created before the key was added may own its data
+under a different volume prefix. This section moves that data onto the pinned name.
+
+Every step below keys off volume names rather than the current project name, so the
+procedure works whether or not you have already pulled the commit that added `name:`.
+
+#### Does this apply to you
+
+List the data volumes on this host:
+
+```bash
+docker volume ls --format '{{.Name}}' | grep '_manticore-data$'
+```
+
+If the only line is `manticore-docker_manticore-data`, nothing here applies and you can
+skip the rest of this section.
+
+If a line with any other prefix appears, that prefix is your old project name. A clone at
+`/opt/manticore`, for example, produces `manticore_manticore-data`.
+
+Do not use `docker compose config` to answer this question. Once the `name:` key is in
+your working tree, it reports `manticore-docker` for everyone, including deployments whose
+data still lives under the old name.
+
+#### Check for a collision first
+
+```bash
+docker volume ls --format '{{.Name}}' | grep -x 'manticore-docker_manticore-data'
+```
+
+If that prints nothing, continue to Option A or Option B.
+
+If it prints a match, both volumes exist and you must resolve that before going further.
+Inspect what is in the target:
+
+```bash
+docker run --rm -v manticore-docker_manticore-data:/data alpine sh -c "ls -la /data; du -sh /data"
+```
+
+Back it up or remove it by hand if it holds anything you do not recognize. The steps below
+assume `manticore-docker_manticore-data` either does not exist or is empty:
+`docker volume create` succeeds silently on an existing volume, and the copy would then
+merge your data on top of whatever is already there.
+
+#### Option A: rename the volume (recommended)
+
+This copies your data onto the volume name Compose uses from now on, so future clones
+behave the same regardless of the directory they land in.
+
+Record the old project name from the listing above:
+
+```bash
+OLD_PROJECT=manticore    # the prefix from ${OLD_PROJECT}_manticore-data above
+```
+
+Stop the old project explicitly. With the `name:` key present, a plain `docker compose
+down` addresses `manticore-docker` and leaves the old containers running:
+
+```bash
+docker compose -p "$OLD_PROJECT" down
+# with the public profile: docker compose -p "$OLD_PROJECT" --profile public down
+```
+
+`down` does not remove named volumes, so your data is not at risk here.
+
+Confirm nothing is still holding the volume:
+
+```bash
+docker ps --filter volume="${OLD_PROJECT}_manticore-data"
+```
+
+This must list no containers. Copying while Manticore is writing produces an unusable copy
+and reports no error at any point.
+
+Copy the data:
+
+```bash
+docker volume create manticore-docker_manticore-data
+docker run --rm \
+    -v "${OLD_PROJECT}_manticore-data":/from \
+    -v manticore-docker_manticore-data:/to \
+    alpine \
+    sh -c "cp -a /from/. /to/"
+```
+
+Compare the two volumes before starting anything:
+
+```bash
+docker run --rm -v "${OLD_PROJECT}_manticore-data":/data alpine sh -c "ls -la /data; du -sh /data"
+docker run --rm -v manticore-docker_manticore-data:/data alpine sh -c "ls -la /data; du -sh /data"
+```
+
+The file listing and the reported size should match. Once they do, pull if you have not
+already, and start:
+
+```bash
+git pull
+docker compose up -d
+# with the public profile: docker compose --profile public up -d
+```
+
+Verify the running deployment itself: your tables should be present and searches should
+return what you expect. Starting successfully is not verification. Only after that, remove
+the old volume by hand:
+
+```bash
+docker volume rm "${OLD_PROJECT}_manticore-data"
+```
+
+#### Option B: keep the old name
+
+Lower risk if you would rather not touch a live volume right now. Write the old project
+name into `.env` literally, substituting your own prefix:
+
+```bash
+echo 'COMPOSE_PROJECT_NAME=manticore' >> .env
+```
+
+`COMPOSE_PROJECT_NAME` takes precedence over the `name:` key in `docker-compose.yml`, so
+Compose keeps using the volume you already have.
+
+This does not survive `./config setup`. The wizard recreates `.env` from `.env.example`,
+which drops any line added by hand. Re-add `COMPOSE_PROJECT_NAME` after any future
+`./config setup` run.
+
 **Back up your data.** Manticore's data lives in the `manticore-data`
 Docker named volume. To get its location on the host:
 

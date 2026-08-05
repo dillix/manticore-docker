@@ -16,6 +16,8 @@
 #
 # Configuration is in the .env file; copy .env.example to .env first.
 
+name: manticore-docker
+
 services:
 
   manticore:
