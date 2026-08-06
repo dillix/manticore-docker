@@ -388,15 +388,40 @@ create the user your Drupal site will authenticate as:
 ./config setup
 ```
 
-It asks for a domain and an ACME email even here, where nothing reads them —
-only Caddy does, and Scenario A has no Caddy. Answer them anyway; they cost
-nothing and are already correct if you later switch to Scenario B.
+Its first question is which scenario you are deploying. Answer **A** and it
+asks two more — an ACME email and the application username — for three in
+total. It does **not** ask for a domain: there is no Caddy here to serve
+one, so it writes `MANTICORE_DOMAIN=localhost` itself.
+
+That value is deliberate rather than a stand-in for "unset". If
+`--profile public` is ever started on this host by mistake, a local hostname
+makes Caddy issue a self-signed certificate from its internal CA and stay
+quiet; a hostname that does not resolve would instead send it into repeated
+Let's Encrypt attempts against a domain that can never validate.
+
+The ACME email is still asked for, even though nothing in Scenario A reads
+it: with a local hostname Caddy uses its internal CA and never contacts
+Let's Encrypt, but its `tls` directive needs an argument to parse at all, so
+the value cannot be empty. The wizard offers a default; if you accept the
+`.env.example` placeholder it says so on screen rather than writing an
+invented address you would find months later with no way to account for it.
 
 The wizard prints the application user's password **once** at the end. Save
 it immediately — it is not stored in `.env` or anywhere else in this
-repository. See
-[Scenario B](#scenario-b--public-https-endpoint-with-caddy) below for a full
-annotated transcript of the wizard; it is the same wizard in both scenarios.
+repository.
+
+[Scenario B](#scenario-b--public-https-endpoint-with-caddy) below carries a
+full annotated transcript, but it is **Scenario B's** transcript: four
+questions, and instructions about DNS, certificates and `--profile public`
+that do not apply here. What a Scenario A run does differently:
+
+- there is no domain question, so the steps read "of 3" rather than "of 4";
+- the ACME email question is worded for a deployment that never uses it, and
+  offers the `.env.example` placeholder as its default instead of stripping
+  it out the way Scenario B does;
+- the closing "Next steps" block is local-only — testing against
+  `http://127.0.0.1:9308` and putting the credential into Drupal. No DNS
+  record, no certificate to wait for, no public profile.
 
 You can now point your local Drupal site at `http://127.0.0.1:9308`, using
 that username and password. The endpoint requires them — requests without
@@ -418,7 +443,7 @@ HTTPS endpoint for it to reach Manticore. There are two ways to do this:
 The Manticore stack stays exactly as in Scenario A — bound to
 `127.0.0.1:9308`, no Caddy, no public ports. Your existing nginx adds
 **one extra `server` block** that terminates TLS and proxies into
-Manticore on localhost. From Drupal's point of view the result is
+Manticore on `127.0.0.1`. From Drupal's point of view the result is
 identical to Scenario B.
 
 > **Your proxy must not authenticate.** The engine checks credentials
@@ -523,6 +548,11 @@ password once:
 ./config setup
 ```
 
+Answer **A** at the scenario question. The public domain here is served by
+your own nginx, not by the bundled Caddy, so the stack is still Scenario A
+and the wizard has no use for the hostname — put it in the nginx `server`
+block above, not in `.env`.
+
 **Step 4. Verify from outside the VPS.**
 
 ```bash
@@ -599,14 +629,16 @@ list).
 
 **1. Run the setup wizard.**
 
-The wizard collects three values, bootstraps the engine's admin, creates the
+The wizard asks which scenario you are deploying, collects the values that
+scenario actually uses, bootstraps the engine's admin, creates the
 application user, and shows you that user's password once:
 
 ```bash
 ./config setup
 ```
 
-It asks three questions, then provisions the engine:
+In Scenario B that is four questions — the scenario, a domain, an ACME email
+and the application username — and then it provisions the engine:
 
 ```
 ============================================================
@@ -615,20 +647,32 @@ It asks three questions, then provisions the engine:
 
 Creating .env from .env.example.
 
-Step 1 of 3 — Domain name
+Step 1 — Deployment scenario
+A — single VPS. Manticore listens on 127.0.0.1 only, for a Drupal
+    site on this same host (or your own reverse proxy in front).
+    No Caddy, no public port, no domain needed.
+B — dedicated Manticore VPS with the bundled Caddy reverse proxy,
+    started with '--profile public'. Caddy terminates TLS on a
+    public domain and obtains a Let's Encrypt certificate.
+
+Scenario (A or B): B
+
+Scenario B — 4 steps in total.
+
+Step 2 of 4 — Domain name
 The fully-qualified hostname pointing at this VPS, with a public
 DNS A record. Example: search.example.com
 Rules: lowercase letters, digits, hyphens and dots only.
 
 Domain: search.example.com
 
-Step 2 of 3 — ACME email
+Step 3 of 4 — ACME email
 Email address used by Let's Encrypt for renewal notices.
 Rules: standard email form, e.g. admin@example.com.
 
 Email: admin@example.com
 
-Step 3 of 3 — Application username
+Step 4 of 4 — Application username
 The engine user the Drupal site will authenticate as. It will be
 created with exactly the grants the module needs, and a password
 shown to you once at the end.
@@ -638,6 +682,7 @@ Username [drupal]: drupal
 
 Summary
 
+  MANTICORE_SCENARIO   = B — bundled Caddy on a public domain
   MANTICORE_DOMAIN     = search.example.com
   MANTICORE_ACME_EMAIL = admin@example.com
   MANTICORE_USERNAME   = drupal
@@ -650,9 +695,15 @@ Write these values to .env and continue? [y/N] y
 .env written.
 ```
 
-The username offers `drupal` as a default; the domain and email do not offer
-one, because the placeholders in `.env.example` cannot work anywhere and
-offering them would only invite a broken deployment.
+The username offers `drupal` as a default; in Scenario B the domain and email
+do not offer one, because the placeholders in `.env.example` cannot work
+anywhere and offering them would only invite a broken deployment. (Scenario A
+is the exception for the email: nothing reads it there, so the placeholder is
+offered and its use announced.)
+
+On a re-run, the scenario question offers whatever `MANTICORE_SCENARIO`
+already records as its default, so you answer it once and press Enter
+thereafter.
 
 Nothing has touched the engine up to this point — aborting here leaves it
 exactly as it was. After you answer `y`, the wizard starts the daemon if it
@@ -768,6 +819,7 @@ the engine's own users and their grants:
 ```
 Current configuration (.env)
 
+  MANTICORE_SCENARIO     = B — bundled Caddy on a public domain
   MANTICORE_DOMAIN       = search.example.com
   MANTICORE_ACME_EMAIL   = admin@example.com
   MANTICORE_USERNAME     = drupal
@@ -1490,9 +1542,11 @@ echo 'COMPOSE_PROJECT_NAME=manticore' >> .env
 `COMPOSE_PROJECT_NAME` takes precedence over the `name:` key in `docker-compose.yml`, so
 Compose keeps using the volume you already have.
 
-This does not survive `./config setup`. The wizard recreates `.env` from `.env.example`,
-which drops any line added by hand. Re-add `COMPOSE_PROJECT_NAME` after any future
-`./config setup` run.
+This survives `./config setup`. The wizard rewrites only the keys it collected and leaves
+every other line alone, `.env.example` being copied only when `.env` does not exist at all —
+so a hand-added `COMPOSE_PROJECT_NAME`, and its comment, come through a re-run untouched.
+See [the `setup` reference](#configuration-helper-reference) for what the wizard does and
+does not rewrite.
 
 **Back up your data.** Manticore's data lives in the `manticore-data`
 Docker named volume. To get its location on the host:
@@ -1708,8 +1762,9 @@ admin reset                   Wipe all engine users and start again
 ./config show
 ```
 
-Displays the four `.env` values with the admin token masked to its first few
-characters, then queries the engine and lists its users with their grants.
+Displays the five `.env` values — the recorded scenario, domain, ACME email,
+username and the admin token, masked to its first few characters — then
+queries the engine and lists its users with their grants.
 Internal `system.*` accounts are deliberately filtered out. If the stack is
 stopped or the token is missing it says so and still prints the `.env` half —
 that is exactly the situation you would run it to diagnose.
@@ -1804,16 +1859,54 @@ Destructive recovery for a lost admin token — see
 ./config setup
 ```
 
-Collects three values (domain, ACME email, application username), bootstraps
-the engine's admin, creates the application user with its grants, verifies
-that credential, and displays its password once. Recommended for first-time
+Asks which scenario this host runs and collects only what that scenario
+uses — **Scenario A**: scenario, ACME email, application username, with
+`MANTICORE_DOMAIN=localhost` written for you; **Scenario B**: scenario,
+domain, ACME email, application username. It then bootstraps the engine's
+admin, creates the application user with its grants, verifies that
+credential, and displays its password once. Recommended for first-time
 deployment, and re-runnable afterwards.
+
+The scenario is asked, never inferred — not from `COMPOSE_PROFILES`, not from
+the current domain, not from anything else. Which scenario a host runs is a
+decision, and the answer is recorded in `MANTICORE_SCENARIO` so it is visible
+in `./config show` afterwards and offered as the default on the next run.
 
 Collection happens before anything else, so aborting during the questions
 leaves the engine untouched. If `.env` already exists and is fully populated,
 the wizard asks before overwriting. If the engine already has an admin and
 the token in `.env` still works, the bootstrap is skipped and it continues
 with the application user.
+
+**A `.env` written before `MANTICORE_SCENARIO` existed keeps working.**
+Nothing infers a value for the missing key — `MANTICORE_DOMAIN=localhost` in
+particular is *not* read as proof of Scenario A, since a Scenario B operator
+may legitimately have used it. Every subcommand behaves exactly as before,
+`./config show` reports the scenario as `(not recorded)`, and the next
+`./config setup` records your answer.
+
+Running the wizard again on a live install to record it is safe: **a re-run
+does not rotate any credential.** If the engine already has an admin and the
+token in `.env` authenticates, the bootstrap is skipped and
+`MANTICORE_ADMIN_TOKEN` is left alone; if the token no longer works the
+wizard stops and writes nothing rather than reissuing anything. The
+application user's password is only reissued if you answer **yes** to *Issue
+a new password for 'drupal'?*, which defaults to no — answer no and the
+password already held in your Drupal Key entity keeps working. `auth.json`
+inside the data volume is only ever read.
+
+`setup` is the safe one. The commands that *do* replace a credential are
+`./config password change` (reissues the application user's password — your
+Drupal Key entity stops authenticating until you update it), `./config token
+rotate` (reissues the admin token, invalidating the previous one
+immediately), and `./config admin reset`. Only the last destroys every user,
+token and grant at once, which is why it asks you to type `reset` rather than
+answer y/N.
+
+The wizard also **preserves keys it does not own.** It rewrites the values it
+collected and leaves every other line in `.env` — including anything you
+added by hand, such as `COMPOSE_PROJECT_NAME` — exactly as it found it.
+`.env.example` is copied only when `.env` does not exist at all.
 
 **Help:**
 

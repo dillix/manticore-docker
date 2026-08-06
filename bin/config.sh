@@ -8,7 +8,8 @@
 # here speaks to the engine over HTTP with wget and parses JSON with sed.
 #
 # It manages two things:
-#   - the .env file (domain, ACME email, application username, admin token);
+#   - the .env file (deployment scenario, domain, ACME email, application
+#     username, admin token);
 #   - the engine's own users, passwords, bearer tokens and grants.
 #
 # Manticore 27.1.5 authenticates natively on both the HTTP and MySQL
@@ -92,6 +93,21 @@ EMAIL_RE='^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'
 # colon is HTTP Basic's separator between username and password. This set
 # excludes both.
 USERNAME_RE='^[A-Za-z0-9_-]{1,32}$'
+# The deployment scenario recorded in MANTICORE_SCENARIO. Lowercase is
+# accepted at the prompt and normalised to uppercase before it is written,
+# so only A and B ever reach .env.
+SCENARIO_RE='^[ABab]$'
+
+# The placeholders .env.example ships. Neither can work anywhere, so the
+# wizard knows them by value: it strips them from the defaults it offers for
+# Scenario B, and says so out loud when Scenario A keeps the email one.
+#
+# These are copies of MANTICORE_DOMAIN and MANTICORE_ACME_EMAIL in
+# .env.example, which says the same thing at those two keys. Change them as
+# a pair — once the two copies disagree, the wizard no longer recognises the
+# placeholder and starts offering search.example.com as a real default.
+PLACEHOLDER_DOMAIN="search.example.com"
+PLACEHOLDER_EMAIL="admin@example.com"
 
 # Authorization header used by every engine call. Set by mc_auth_admin (the
 # admin bearer token from .env) or mc_auth_basic (a username and password,
@@ -286,6 +302,23 @@ validate_email() {
 
 validate_username() {
     printf '%s' "$1" | grep -Eq "$USERNAME_RE"
+}
+
+validate_scenario() {
+    printf '%s' "$1" | grep -Eq "$SCENARIO_RE"
+}
+
+# One-line description of a scenario, for `show` and the wizard's summary.
+# An unrecognised value is echoed back rather than guessed at: .env is the
+# operator's file, and inventing a meaning for something we did not write
+# would be worse than admitting we do not know it.
+scenario_label() {
+    case "${1:-}" in
+        A) printf 'A — single VPS, no reverse proxy' ;;
+        B) printf 'B — bundled Caddy on a public domain' ;;
+        "") printf '(not recorded)' ;;
+        *) printf '%s (unrecognised)' "$1" ;;
+    esac
 }
 
 # -----------------------------------------------------------------------------
@@ -737,7 +770,8 @@ cmd_show() {
         warn "No $ENV_FILE found. Run './config setup' to create one."
         return 1
     fi
-    local domain email username token
+    local scenario domain email username token
+    scenario=$(get_env_var MANTICORE_SCENARIO || true)
     domain=$(get_env_var MANTICORE_DOMAIN || true)
     email=$(get_env_var MANTICORE_ACME_EMAIL || true)
     username=$(get_env_var MANTICORE_USERNAME || true)
@@ -745,11 +779,26 @@ cmd_show() {
 
     bold "Current configuration ($ENV_FILE)"
     printf '\n'
+    if [ -n "$scenario" ]; then
+        printf '  MANTICORE_SCENARIO     = %s\n' "$(scenario_label "$scenario")"
+    else
+        printf '  MANTICORE_SCENARIO     = %s%s%s\n' \
+            "$C_YELLOW" "$(scenario_label "")" "$C_RESET"
+    fi
     printf '  MANTICORE_DOMAIN       = %s\n'  "${domain:-${C_YELLOW}(not set)${C_RESET}}"
     printf '  MANTICORE_ACME_EMAIL   = %s\n'  "${email:-${C_YELLOW}(not set)${C_RESET}}"
     printf '  MANTICORE_USERNAME     = %s\n'  "${username:-${C_YELLOW}(not set)${C_RESET}}"
     printf '  MANTICORE_ADMIN_TOKEN  = %s\n'  "$(mask_token "$token")"
     printf '\n'
+    if [ -z "$scenario" ]; then
+        # No value is inferred. MANTICORE_DOMAIN=localhost in particular is
+        # not proof of Scenario A — a Scenario B operator may legitimately
+        # have used it — and which scenario a host runs is the operator's
+        # decision, not ours to guess.
+        echo "  This $ENV_FILE predates MANTICORE_SCENARIO. Everything works"
+        echo "  without it; the next './config setup' records your answer."
+        printf '\n'
+    fi
     echo "  The application user's password is not stored here."
     echo "  Issue a new one with './config password change'."
     printf '\n'
@@ -1292,11 +1341,16 @@ cmd_setup_collect() {
     announce_env_state || { info "Aborted. Nothing was changed."; return 0; }
 
     if [ -f "$ENV_FILE" ]; then
-        local cur_domain cur_email cur_username
+        local cur_scenario cur_domain cur_email cur_username
+        cur_scenario=$(get_env_var MANTICORE_SCENARIO 2>/dev/null || true)
         cur_domain=$(get_env_var MANTICORE_DOMAIN 2>/dev/null || true)
         cur_email=$(get_env_var MANTICORE_ACME_EMAIL 2>/dev/null || true)
         cur_username=$(get_env_var MANTICORE_USERNAME 2>/dev/null || true)
 
+        # MANTICORE_SCENARIO is deliberately NOT counted here. A .env written
+        # before that key existed is complete in every way that matters, and
+        # letting its absence skip the overwrite confirmation below would make
+        # the wizard less careful with older installs, not more.
         local empty_count=0
         [ -z "$cur_domain" ]   && empty_count=$((empty_count + 1))
         [ -z "$cur_email" ]    && empty_count=$((empty_count + 1))
@@ -1311,6 +1365,7 @@ cmd_setup_collect() {
             warn ".env already exists and is fully populated."
             echo "" >&2
             echo "Current values:" >&2
+            echo "  MANTICORE_SCENARIO   = $(scenario_label "$cur_scenario")" >&2
             echo "  MANTICORE_DOMAIN     = $cur_domain" >&2
             echo "  MANTICORE_ACME_EMAIL = $cur_email" >&2
             echo "  MANTICORE_USERNAME   = $cur_username" >&2
@@ -1328,37 +1383,108 @@ cmd_setup_collect() {
     fi
     echo ""
 
-    # Step 1: domain.
-    bold "Step 1 of 3 — Domain name"
-    echo "The fully-qualified hostname pointing at this VPS, with a public"
-    echo "DNS A record. Example: search.example.com"
-    echo "Rules: lowercase letters, digits, hyphens and dots only."
+    # Step 1: the deployment scenario.
+    #
+    # Labelled without a total on purpose: the total is 3 or 4, and the
+    # answer to this very question is what decides which. Every label after
+    # this one carries $total_steps.
+    #
+    # The scenario is asked, never inferred — not from COMPOSE_PROFILES, not
+    # from the current MANTICORE_DOMAIN, not from anything else. Which
+    # scenario a host runs is the operator's decision.
+    bold "Step 1 — Deployment scenario"
+    echo "A — single VPS. Manticore listens on 127.0.0.1 only, for a Drupal"
+    echo "    site on this same host (or your own reverse proxy in front)."
+    echo "    No Caddy, no public port, no domain needed."
+    echo "B — dedicated Manticore VPS with the bundled Caddy reverse proxy,"
+    echo "    started with '--profile public'. Caddy terminates TLS on a"
+    echo "    public domain and obtains a Let's Encrypt certificate."
     echo ""
-    local default_domain
-    default_domain=$(get_env_var MANTICORE_DOMAIN 2>/dev/null || true)
-    # Strip the placeholder from .env.example so the user is not nudged
-    # into accepting it accidentally.
-    [ "$default_domain" = "search.example.com" ] && default_domain=""
-    local new_domain
-    new_domain=$(prompt_value "Domain" "$default_domain" validate_domain \
-        "lowercase letters, digits, hyphens and dots only")
+    # An already-recorded scenario is offered as the default, so a re-run
+    # does not make the operator answer this again.
+    local default_scenario
+    default_scenario=$(get_env_var MANTICORE_SCENARIO 2>/dev/null || true)
+    local new_scenario
+    new_scenario=$(prompt_value "Scenario (A or B)" "$default_scenario" \
+        validate_scenario "answer A or B")
+    # Lowercase is accepted above; only A or B is ever written.
+    new_scenario=$(printf '%s' "$new_scenario" | tr 'ab' 'AB')
     echo ""
 
-    # Step 2: email.
-    bold "Step 2 of 3 — ACME email"
-    echo "Email address used by Let's Encrypt for renewal notices."
-    echo "Rules: standard email form, e.g. admin@example.com."
+    local total_steps
+    if [ "$new_scenario" = "A" ]; then
+        total_steps=3
+    else
+        total_steps=4
+    fi
+    info "Scenario $new_scenario — $total_steps steps in total."
     echo ""
-    local default_email
-    default_email=$(get_env_var MANTICORE_ACME_EMAIL 2>/dev/null || true)
-    [ "$default_email" = "admin@example.com" ] && default_email=""
+
+    local new_domain default_email placeholder_email=no
+    if [ "$new_scenario" = "A" ]; then
+        # Scenario A has no Caddy, so there is nothing to ask a domain for.
+        #
+        # 'localhost' is deliberate, and it is not a stand-in for "unset". If
+        # someone later starts '--profile public' on this host by mistake,
+        # Caddy sees a local hostname, issues a self-signed certificate from
+        # its internal CA and stays quiet. A non-resolving hostname would
+        # instead send it into repeated Let's Encrypt attempts against a
+        # domain that can never validate.
+        new_domain="localhost"
+
+        # The ACME email is still asked. Nothing reads it in Scenario A —
+        # with a local hostname Caddy uses its internal CA and never contacts
+        # an ACME endpoint — but the Caddyfile's `tls {$MANTICORE_ACME_EMAIL}`
+        # needs an argument to parse at all, so the key cannot be left empty.
+        # A default is offered and any fallback to the placeholder is
+        # announced below: an invented value silently written into a
+        # production .env is one nobody can account for months later.
+        bold "Step 2 of $total_steps — ACME email"
+        echo "Not used in Scenario A: with a local hostname Caddy uses its"
+        echo "internal CA and never contacts Let's Encrypt. It is asked"
+        echo "because the value must not be empty, and because it is already"
+        echo "correct if you later switch to Scenario B."
+        echo "Rules: standard email form, e.g. $PLACEHOLDER_EMAIL."
+        echo ""
+        default_email=$(get_env_var MANTICORE_ACME_EMAIL 2>/dev/null || true)
+        # Unlike Scenario B below, the placeholder is NOT stripped here: it
+        # is a perfectly good answer for a deployment that never uses it, and
+        # leaving the operator with no default at all would only invite an
+        # invented address.
+        [ -z "$default_email" ] && default_email="$PLACEHOLDER_EMAIL"
+    else
+        bold "Step 2 of $total_steps — Domain name"
+        echo "The fully-qualified hostname pointing at this VPS, with a public"
+        echo "DNS A record. Example: $PLACEHOLDER_DOMAIN"
+        echo "Rules: lowercase letters, digits, hyphens and dots only."
+        echo ""
+        local default_domain
+        default_domain=$(get_env_var MANTICORE_DOMAIN 2>/dev/null || true)
+        # Strip the placeholder from .env.example so the user is not nudged
+        # into accepting it accidentally.
+        [ "$default_domain" = "$PLACEHOLDER_DOMAIN" ] && default_domain=""
+        new_domain=$(prompt_value "Domain" "$default_domain" validate_domain \
+            "lowercase letters, digits, hyphens and dots only")
+        echo ""
+
+        bold "Step 3 of $total_steps — ACME email"
+        echo "Email address used by Let's Encrypt for renewal notices."
+        echo "Rules: standard email form, e.g. $PLACEHOLDER_EMAIL."
+        echo ""
+        default_email=$(get_env_var MANTICORE_ACME_EMAIL 2>/dev/null || true)
+        [ "$default_email" = "$PLACEHOLDER_EMAIL" ] && default_email=""
+    fi
+
     local new_email
     new_email=$(prompt_value "Email" "$default_email" validate_email \
         "must look like name@domain.tld")
+    if [ "$new_scenario" = "A" ] && [ "$new_email" = "$PLACEHOLDER_EMAIL" ]; then
+        placeholder_email=yes
+    fi
     echo ""
 
-    # Step 3: username.
-    bold "Step 3 of 3 — Application username"
+    # Last step: username. Same in both scenarios.
+    bold "Step $total_steps of $total_steps — Application username"
     echo "The engine user the Drupal site will authenticate as. It will be"
     echo "created with exactly the grants the module needs, and a password"
     echo "shown to you once at the end."
@@ -1379,9 +1505,22 @@ cmd_setup_collect() {
 
     bold "Summary"
     echo ""
-    echo "  MANTICORE_DOMAIN     = $new_domain"
+    echo "  MANTICORE_SCENARIO   = $(scenario_label "$new_scenario")"
+    if [ "$new_scenario" = "A" ]; then
+        echo "  MANTICORE_DOMAIN     = $new_domain (not asked for; Caddy only,"
+        echo "                         and only if you start --profile public)"
+    else
+        echo "  MANTICORE_DOMAIN     = $new_domain"
+    fi
     echo "  MANTICORE_ACME_EMAIL = $new_email"
     echo "  MANTICORE_USERNAME   = $new_username"
+    if [ "$placeholder_email" = "yes" ]; then
+        echo ""
+        warn "The ACME email above is the placeholder from $ENV_EXAMPLE. It is"
+        warn "written because the value cannot be empty, and nothing in"
+        warn "Scenario A reads it. Set a real one before switching to"
+        warn "Scenario B:  ./config email you@example.com"
+    fi
     echo ""
     echo "Next, the engine's admin is bootstrapped and the user above is"
     echo "created. Nothing has been changed yet."
@@ -1392,6 +1531,7 @@ cmd_setup_collect() {
         return 0
     fi
 
+    set_env_var MANTICORE_SCENARIO   "$new_scenario"
     set_env_var MANTICORE_DOMAIN     "$new_domain"
     set_env_var MANTICORE_ACME_EMAIL "$new_email"
     set_env_var MANTICORE_USERNAME   "$new_username"
@@ -1486,8 +1626,34 @@ cmd_setup_provision() {
         echo ""
     fi
 
-    local domain
+    local domain scenario
     domain=$(get_env_var MANTICORE_DOMAIN 2>/dev/null || true)
+    scenario=$(get_env_var MANTICORE_SCENARIO 2>/dev/null || true)
+
+    # Scenario A has no Caddy, no public port and no certificate to wait
+    # for, so it gets its own closing block. Anything else — including a
+    # .env written before MANTICORE_SCENARIO existed — keeps the Scenario B
+    # instructions this wizard has always printed.
+    if [ "$scenario" = "A" ]; then
+        bold "Next steps:"
+        echo ""
+        echo "  # 1. The manticore service is already running. It listens on"
+        echo "  #    127.0.0.1:9308 (HTTP, used by Drupal) and 127.0.0.1:9306"
+        echo "  #    (MySQL protocol). Neither port is reachable from outside"
+        echo "  #    this host."
+        echo ""
+        echo "  # 2. Test locally, as the application user:"
+        echo "  curl -s -u '$user:<the-password-above>' \\"
+        echo "       http://127.0.0.1:9308/sql?mode=raw -d 'SHOW STATUS'"
+        echo ""
+        echo "  # 3. Put the username and password into Drupal: Search API"
+        echo "  #    server settings, with the password held in a Key entity."
+        echo "  #    Point it at http://127.0.0.1:9308 — the literal IPv4"
+        echo "  #    address, not 'localhost', which resolves to ::1 first on"
+        echo "  #    many systems while this port is bound to IPv4 only."
+        echo ""
+        return 10
+    fi
 
     bold "Next steps:"
     echo ""

@@ -325,8 +325,8 @@ admin_token_works() {
 setup_failed() {
     if [ "$CADDY_RUNNING" = "yes" ]; then
         echo "" >&2
-        warn "Note: $ENV_FILE was updated with the domain and ACME email you"
-        warn "entered, but Caddy is still running with the previous values."
+        warn "Note: $ENV_FILE was updated with the values you entered, but"
+        warn "Caddy is still running with the previous ones."
         warn "After fixing the problem above, either re-run './config setup'"
         warn "or recreate Caddy directly:"
         warn "  docker compose --profile public up -d --force-recreate caddy"
