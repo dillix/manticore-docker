@@ -20,7 +20,8 @@
 #
 # Subcommands:
 #   setup                Interactive wizard (host wrapper drives two phases)
-#   show                 .env plus the engine's users and grants
+#   show                 .env, the morphology dictionaries, and the
+#                        engine's users and grants
 #   check                Authenticated query — proves the engine executes SQL
 #   domain <fqdn>        Set MANTICORE_DOMAIN
 #   email <addr>         Set MANTICORE_ACME_EMAIL
@@ -763,6 +764,75 @@ show_password() {
 }
 
 # -----------------------------------------------------------------------------
+# Morphology dictionaries
+# -----------------------------------------------------------------------------
+# The lemmatizer dictionaries (`morphology='lemmatize_ru_all'` and friends)
+# are a property of the IMAGE, not of the data volume: the `manticore`
+# package installs ru/en/de/uk `.pak` files into /usr/share/manticore, which
+# is also the engine's own default lemmatizer_base. Nothing is downloaded,
+# nothing is installed, and there is no subcommand to install anything —
+# reporting what is there is the whole job.
+#
+# Whether a table USES a dictionary is not decided here. `morphology` is a
+# per-table CREATE TABLE option, so that belongs to whatever creates the
+# table (the Drupal module). This stack supplies the dictionaries and the
+# path, and nothing else.
+
+# The engine's compiled-in default, and the value docker-compose.yml sets
+# explicitly. Used when the daemon cannot be asked.
+LEMMATIZER_BASE_DEFAULT="/usr/share/manticore"
+
+# The daemon's effective lemmatizer_base.
+#
+# Three outcomes, and the caller MUST branch on the exit code rather than on
+# emptiness, because two of them print nothing:
+#
+#   0  the daemon answered and had an explicit value — printed on stdout
+#   2  the daemon answered and had no such row
+#   1  the daemon could not be asked at all
+#
+# 2 is not an error and does not mean "unset": SHOW SETTINGS lists only
+# directives that are explicitly configured, so a missing row means the
+# daemon is running on its compiled-in default. 1 means we know nothing —
+# the stack is down, or .env has no admin token. Collapsing those two into
+# "empty" would let `show` print a path it never read as though it had.
+mc_lemmatizer_base() {
+    local body value
+    [ -n "$MC_AUTH_HEADER" ] || return 1
+    body=$(mc_sql 'SHOW SETTINGS' 2>/dev/null) || return 1
+    value=$(printf '%s' "$body" | mc_rows |
+        sed -n 's/.*"Setting_name":"common\.lemmatizer_base","Value":"\([^"]*\)".*/\1/p')
+    [ -n "$value" ] || return 2
+    printf '%s' "$value"
+}
+
+# Language codes of the `.pak` files in a directory, space separated.
+#
+# Two outcomes, again distinguished by exit code and not by an empty string:
+#
+#   0  the directory is visible here — the codes are on stdout, and an empty
+#      stdout means it genuinely holds no dictionaries
+#   1  the directory is not visible from this container, so nothing at all
+#      can be said about it
+#
+# The listing is read from THIS container, which runs the same image tag as
+# the daemon — docker-compose.yml gives both services one YAML anchor so
+# they cannot drift — so what is listed is what the daemon has. That holds
+# only because the path is image content. The `config`
+# service mounts just `.:/work` and not the data volume, so an operator who
+# repoints lemmatizer_base into the volume lands squarely in case 1, and the
+# caller has to say "cannot check" rather than "none installed".
+lemmatizer_dictionaries() {
+    local dir="$1" f out=""
+    [ -d "$dir" ] || return 1
+    for f in "$dir"/*.pak; do
+        [ -e "$f" ] || continue
+        out="$out $(basename "$f" .pak)"
+    done
+    printf '%s' "${out# }"
+}
+
+# -----------------------------------------------------------------------------
 # Subcommand: show
 # -----------------------------------------------------------------------------
 cmd_show() {
@@ -801,6 +871,63 @@ cmd_show() {
     fi
     echo "  The application user's password is not stored here."
     echo "  Issue a new one with './config password change'."
+    printf '\n'
+
+    # Which dictionaries this host actually has, and where the engine looks
+    # for them. Both are real properties of the deployment, and neither is
+    # visible anywhere else without reading the image.
+    #
+    # Authentication is attempted quietly first, purely so the path can be
+    # read from the running daemon. Failing that is not fatal here: the
+    # dictionaries can still be listed, because they are image content and
+    # this container runs the same image.
+    bold "Morphology dictionaries"
+    printf '\n'
+
+    local lem_base lem_rc lem_note dicts dict_rc
+    mc_auth_admin 2>/dev/null || true
+
+    lem_rc=0
+    lem_base=$(mc_lemmatizer_base) || lem_rc=$?
+    case "$lem_rc" in
+        0)
+            lem_note="read from the running engine"
+            ;;
+        2)
+            lem_base="$LEMMATIZER_BASE_DEFAULT"
+            lem_note="the engine's built-in default — no explicit setting"
+            ;;
+        *)
+            # Nothing was read from the engine. Say so, and be explicit that
+            # the path below comes from docker-compose.yml rather than from
+            # anything the daemon reported.
+            lem_base="$LEMMATIZER_BASE_DEFAULT"
+            lem_note="engine not reachable — this is the docker-compose.yml value"
+            ;;
+    esac
+    printf '  lemmatizer_base = %s\n' "$lem_base"
+    printf '                    %s\n' "$lem_note"
+    printf '\n'
+
+    dict_rc=0
+    dicts=$(lemmatizer_dictionaries "$lem_base") || dict_rc=$?
+    if [ "$dict_rc" -ne 0 ]; then
+        warn "  Installed: cannot check — $lem_base does not exist in this"
+        warn "  helper container, which sees the image but not the data volume."
+        warn "  Check it in the daemon instead:"
+        warn "    docker compose exec manticore ls -la $lem_base"
+    elif [ -z "$dicts" ]; then
+        warn "  Installed: none — no .pak files in $lem_base."
+        warn "  Any table created with morphology='lemmatize_*' will be"
+        warn "  REJECTED by the engine until a dictionary is present."
+    else
+        printf '  Installed: %s\n' "$dicts"
+        printf '\n'
+        echo "  These ship inside the image and need no installation. They are"
+        echo "  used only by tables created with a morphology='lemmatize_*'"
+        echo "  option, which is set per table by whatever creates it — this"
+        echo "  stack supplies the dictionaries, not the decision to use them."
+    fi
     printf '\n'
 
     # The engine's own state. This is best-effort on purpose: a stopped
@@ -1704,7 +1831,8 @@ Usage:
 
 Subcommands:
   setup                         Interactive wizard for first-time config
-  show                          Display .env plus the engine's users/grants
+  show                          Display .env, the morphology dictionaries
+                                and the engine's users/grants
   check                         Authenticated query against the engine
   domain <fqdn>                 Set MANTICORE_DOMAIN
   email <addr>                  Set MANTICORE_ACME_EMAIL

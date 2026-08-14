@@ -18,10 +18,22 @@
 
 name: manticore-docker
 
+# The Manticore image tag, shared by the `manticore` daemon and the `config`
+# helper below. They are deliberately one value rather than two: `./config
+# show` lists the morphology dictionaries by reading /usr/share/manticore in
+# the helper container, because those `.pak` files are image content rather
+# than volume content. The helper therefore has to run the same image as the
+# daemon for what it reports to be true of the daemon. Anchoring the tag
+# makes that structural instead of something to remember on an upgrade.
+#
+# Compose ignores top-level keys prefixed with `x-`, so this defines nothing
+# but the anchor.
+x-manticore-image: &manticore_image manticoresearch/manticore:27.1.5
+
 services:
 
   manticore:
-    image: manticoresearch/manticore:27.1.5
+    image: *manticore_image
     container_name: manticore
     restart: unless-stopped
 
@@ -43,9 +55,30 @@ services:
     # bootstrapped the daemon answers everything with 401 — tables load
     # and are intact, they are simply inaccessible. `./config setup`
     # bootstraps the admin and creates the application user.
+    #
+    # common_lemmatizer_base is the one `common_` setting here (the image
+    # maps that prefix to the `common` config section the same way it maps
+    # `searchd_` to `searchd`). It points at the directory holding the
+    # lemmatizer dictionaries used by the `morphology='lemmatize_*'` table
+    # options — see "Morphology and lemmatization" in the README.
+    #
+    # The value is the engine's own default, and the dictionaries are
+    # already there: the `manticore` package installs ru/en/de/uk `.pak`
+    # files into /usr/share/manticore inside the image. So this line
+    # changes no behaviour — lemmatization works without it — and exists
+    # to state the path rather than leave it to an undocumented default.
+    #
+    # It was checked to be inert before being added, because it does
+    # create a `common` section where the generated config previously had
+    # none. On 27.1.5 the only difference between the two is the
+    # `lemmatizer_base` line itself: `SHOW SETTINGS`, `SHOW VARIABLES`,
+    # `SHOW PLUGINS`, the startup log and `CREATE FUNCTION` behaviour are
+    # otherwise identical. In particular `plugin_dir` already sits at its
+    # default with no `common` section, so creating one does not move it.
     environment:
       searchd_not_terms_only_allowed: 1
       searchd_auth: 1
+      common_lemmatizer_base: /usr/share/manticore
 
     # Bind ports to 127.0.0.1 only. The engine authenticates natively, so
     # this is defence in depth rather than the only barrier — but it keeps
@@ -144,7 +177,7 @@ services:
   #
   # Examples:
   #   ./config setup                   # first-time wizard
-  #   ./config show                    # .env plus the engine's users
+  #   ./config show                    # .env, dictionaries, engine users
   #   ./config check                   # authenticated query against the engine
   #   ./config domain search.example.com
   #   ./config email admin@example.com
@@ -154,7 +187,7 @@ services:
   #   ./config token rotate            # new MANTICORE_ADMIN_TOKEN
   #   ./config admin reset             # destructive recovery
   config:
-    image: manticoresearch/manticore:27.1.5
+    image: *manticore_image
     profiles: ["tools"]
     environment:
       HOST_UID: ${HOST_UID:-1000}

@@ -32,6 +32,7 @@ Drupal module, but it is generic — any HTTP client can talk to it.
 - [Connecting from Drupal](#connecting-from-drupal)
 - [Operations](#operations)
 - [Embedding models for vector search](#embedding-models-for-vector-search)
+- [Morphology and lemmatization](#morphology-and-lemmatization)
 - [Configuration helper reference](#configuration-helper-reference)
 - [Troubleshooting](#troubleshooting)
 - [License](#license)
@@ -1727,6 +1728,212 @@ Replication is only needed for multi-node clusters; a single isolated node
 does not use it.
 
 
+## Morphology and lemmatization
+
+Morphology is what makes a search for `mice` find a document containing
+`mouse`. Manticore offers two kinds, set per table with the `morphology`
+option at `CREATE TABLE`:
+
+- **Stemmers** (`stem_en`, `stem_ru`, …) chop words down by rule. They need
+  nothing installed and are always available.
+- **Lemmatizers** (`lemmatize_en_all`, `lemmatize_ru_all`, …) look words up
+  in a dictionary and return real base forms. They need a `.pak` dictionary
+  file.
+
+**The dictionaries are already installed.** This is the short version of
+this whole section: the `manticore` package ships them inside the image, at
+the path the engine reads by default. There is nothing to download, nothing
+to mount, and no `./config` subcommand to run.
+
+| Language | Code | `.pak` size |
+|---|---|---|
+| English | `en` | 1.6 MB |
+| German | `de` | 7.2 MB |
+| Russian | `ru` | 9.8 MB |
+| Ukrainian | `uk` | 29.9 MB |
+
+All four live in `/usr/share/manticore` inside the container — about 48 MB
+of the image you already pulled. They are byte-identical to the tarballs
+published at `repo.manticoresearch.com/repository/morphology/`, whose index
+currently lists exactly these four languages and no others.
+
+`docker-compose.yml` sets the directory explicitly:
+
+```yaml
+    environment:
+      common_lemmatizer_base: /usr/share/manticore
+```
+
+That value is also the engine's own built-in default, so the line changes no
+behaviour — lemmatization works with it removed. It is there to state the
+path in the file rather than leave it implicit.
+
+Confirm what this host has:
+
+```bash
+./config show
+```
+
+```
+Morphology dictionaries
+
+  lemmatizer_base = /usr/share/manticore
+                    read from the running engine
+
+  Installed: de en ru uk
+```
+
+### Choosing a morphology is the client's job, not the stack's
+
+There is deliberately no setting here to "turn the lemmatizer on". Morphology
+is fixed per table when the table is created, so the choice belongs to
+whatever creates it — for Drupal, that is the
+[Search API Manticore](https://www.drupal.org/project/search_api_manticore)
+module, per index. This stack's responsibility ends at supplying the
+dictionaries and the path to them.
+
+A switch here would be actively misleading: it would suggest the stack
+controls something it does not, and could leave you believing lemmatization
+is on while the client is still creating tables with `stem_ru`.
+
+### What a lemmatizer buys over a stemmer
+
+Measured on this image, with `CALL KEYWORDS` showing the token each table
+actually indexes:
+
+| Query word | `lemmatize_en_all` | `stem_en` |
+|---|---|---|
+| `ran` | `run` | `ran` |
+| `running` | `run` | `run` |
+| `mice` | `mouse` | `mice` |
+| `geese` | `goose` | `gees` |
+
+| Query word | `lemmatize_ru_all` | `stem_ru` |
+|---|---|---|
+| `люди` | `человек` | `люд` |
+
+The stemmer cannot connect `ran` to `run`, `mice` to `mouse`, or `люди` to
+`человек`, because no suffix rule relates them — the words share no stem.
+A dictionary can. In exchange, a stemmer costs no memory and covers any
+language approximately, while a lemmatizer covers four languages precisely.
+
+Which to use is a judgement about your content, and worth measuring on it
+rather than assuming.
+
+### One index per language, or one index for all of them
+
+`morphology` accepts a **comma-separated list**, so a single table can carry
+several languages:
+
+```sql
+CREATE TABLE polyglot (title text)
+  morphology='lemmatize_ru_all, lemmatize_en_all, lemmatize_de_all'
+```
+
+Verified end to end: with Russian, English and German documents in that one
+table, a query in each language retrieves its own document. So a multilingual
+site does **not** structurally need an index per language.
+
+Two caveats before choosing that:
+
+1. **Order matters, and processing stops early.** The manual: processors are
+   "applied to incoming words in the order they are listed, and the
+   processing will stop once one of the stemmers modifies the word." The
+   first processor to change a word wins, and the rest never see it.
+2. **The `_all` variants add cross-language noise.** In the three-language
+   table above, `geese` indexed as `geesen geese goose` and `ging` as
+   `gehen g ging` — earlier processors firing on words from another
+   language. Harmless for recall, but it inflates the dictionary and can
+   cost precision.
+
+Where a site's languages are cleanly separated into different indexes
+anyway, a single morphology per index stays the cleaner choice. The
+comma-separated list is what makes a genuinely mixed-language index possible.
+
+### When a dictionary is missing
+
+Only relevant if you repoint `common_lemmatizer_base` somewhere else, since
+nothing is missing by default. The engine loads a dictionary lazily, when a
+table that needs it is created — not at daemon start. So a missing file does
+not stop the stack; it fails the `CREATE TABLE`:
+
+```json
+{"error":"error adding table 'x': failed to open /some/dir/ru.pak: No such file or directory"}
+```
+
+The table is **not** created, which is the correct outcome: it fails loudly
+rather than silently giving you an index with no morphology.
+
+Because the load is lazy, dropping a dictionary into place takes effect
+immediately — the next `CREATE TABLE` succeeds against the same running
+daemon, with **no restart**.
+
+> **Check morphology over `/sql?mode=raw`, never `/cli`.** `/cli` is served
+> through Buddy, which can report a failed `CREATE TABLE` as `Query OK` and
+> silently drop the offending column. The error above appears in full on
+> `/sql?mode=raw`, which `searchd` serves directly. Every command in this
+> section uses it for that reason.
+
+One trap worth knowing: if you ignore a failed `CREATE TABLE` and insert
+anyway, Manticore auto-creates the table from the document — with no
+morphology at all. The error is loud, but carrying on past it is quiet.
+
+### Verify it yourself
+
+Proves the dictionary is loaded and *used*, not merely present. Uses
+`$MC_AUTH` from [Verify the installation](#verify-the-installation):
+
+```bash
+# Two tables, identical but for the morphology.
+curl -s -u "$MC_AUTH" 'http://127.0.0.1:9308/sql?mode=raw' \
+  --data-urlencode "query=CREATE TABLE lem_probe (title text) morphology='lemmatize_ru_all'"
+curl -s -u "$MC_AUTH" 'http://127.0.0.1:9308/sql?mode=raw' \
+  --data-urlencode "query=CREATE TABLE stem_probe (title text) morphology='stem_ru'"
+
+# Index the singular in both.
+curl -s -u "$MC_AUTH" 'http://127.0.0.1:9308/sql?mode=raw' \
+  --data-urlencode "query=INSERT INTO lem_probe (id, title) VALUES (1, 'человек')"
+curl -s -u "$MC_AUTH" 'http://127.0.0.1:9308/sql?mode=raw' \
+  --data-urlencode "query=INSERT INTO stem_probe (id, title) VALUES (1, 'человек')"
+
+# Search the irregular plural. The lemmatizer table hits; the stemmer's does not.
+curl -s -u "$MC_AUTH" 'http://127.0.0.1:9308/sql?mode=raw' \
+  --data-urlencode "query=SELECT id FROM lem_probe WHERE MATCH('люди')"
+curl -s -u "$MC_AUTH" 'http://127.0.0.1:9308/sql?mode=raw' \
+  --data-urlencode "query=SELECT id FROM stem_probe WHERE MATCH('люди')"
+```
+
+The first search returns `{"id":1}` and the second returns nothing. To see
+why, ask what each table made of the word:
+
+```bash
+curl -s -u "$MC_AUTH" 'http://127.0.0.1:9308/sql?mode=raw' \
+  --data-urlencode "query=CALL KEYWORDS('люди', 'lem_probe')"
+# "tokenized":"люди","normalized":"человек"   <- the dictionary at work
+
+curl -s -u "$MC_AUTH" 'http://127.0.0.1:9308/sql?mode=raw' \
+  --data-urlencode "query=CALL KEYWORDS('люди', 'stem_probe')"
+# "tokenized":"люди","normalized":"люд"       <- the stemmer's best effort
+```
+
+Clean up:
+
+```bash
+curl -s -u "$MC_AUTH" 'http://127.0.0.1:9308/sql?mode=raw' \
+  --data-urlencode "query=DROP TABLE lem_probe"
+curl -s -u "$MC_AUTH" 'http://127.0.0.1:9308/sql?mode=raw' \
+  --data-urlencode "query=DROP TABLE stem_probe"
+```
+
+### The CI image does not need this
+
+The separate `ghcr.io/dillix/manticore-ci` image used by the Drupal module's
+test suite needs no dictionary and is unaffected by anything here. Those
+tests assert the *structure* of the queries the module builds, not
+linguistic results, and the stemmers cover that without the weight. Nothing
+in this section applies to it.
+
+
 ## Configuration helper reference
 
 The `./config` wrapper is a single entrypoint for managing both the `.env`
@@ -1746,7 +1953,8 @@ There are no flags; every argument is positional.
 
 ```
 setup                         Interactive wizard for first-time config
-show                          Display .env plus the engine's users/grants
+show                          Display .env, the morphology dictionaries
+                              and the engine's users/grants
 check                         Authenticated query against the engine
 domain <fqdn>                 Set MANTICORE_DOMAIN
 email <addr>                  Set MANTICORE_ACME_EMAIL
@@ -1763,11 +1971,22 @@ admin reset                   Wipe all engine users and start again
 ```
 
 Displays the five `.env` values — the recorded scenario, domain, ACME email,
-username and the admin token, masked to its first few characters — then
-queries the engine and lists its users with their grants.
+username and the admin token, masked to its first few characters — then the
+morphology dictionaries installed on this host and the directory the engine
+reads them from, and finally the engine's users with their grants.
 Internal `system.*` accounts are deliberately filtered out. If the stack is
 stopped or the token is missing it says so and still prints the `.env` half —
 that is exactly the situation you would run it to diagnose.
+
+The dictionary listing is careful about what it actually knows. The path is
+labelled by where it came from: read from the running engine, the engine's
+built-in default, or — when the daemon cannot be reached — the value in
+`docker-compose.yml`, which is a statement about the file rather than about
+the daemon. Likewise, "no dictionaries" and "cannot check from here" are
+reported as different things, because they are: the helper container sees the
+image but not the data volume, so a `lemmatizer_base` pointed into the volume
+is something it must decline to answer rather than report as empty. See
+[Morphology and lemmatization](#morphology-and-lemmatization).
 
 **Check that the engine is reachable and the token works:**
 
