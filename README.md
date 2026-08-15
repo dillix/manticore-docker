@@ -1395,10 +1395,98 @@ Credential changes need no recreate at all — Caddy holds no credentials.
 See [Configuration helper reference](#configuration-helper-reference)
 for the full list of subcommands.
 
+**Update the stack.** Picking up new commits to this repository — fixes,
+documentation, new `./config` features — is the same `git pull` used to
+[install it](#deploy-the-stack) in the first place, followed by recreating
+the containers so any changed file takes effect. This is a different
+operation from "Upgrade Manticore" below, which moves the pinned *engine*
+version; this one updates the stack's own files.
+
+1. Pull:
+
+   ```bash
+   cd /opt/manticore              # or wherever you cloned it
+   git status --short
+   git pull
+   ```
+
+   **`git status` first is not decorative.** "Upgrade Manticore" below has
+   you edit the `x-manticore-image` anchor in `docker-compose.yml` directly,
+   which leaves that file dirty in the working tree — and if the commits
+   you're about to pull also touch `docker-compose.yml`, `git pull`
+   conflicts on exactly that file instead of merging cleanly. With the
+   anchor there is only one line to carry forward, so the simplest route is
+   to stash it, pull, and reapply:
+
+   ```bash
+   git stash
+   git pull
+   git stash pop
+   ```
+
+   If `git stash pop` itself conflicts — for example because the pulled
+   commit also changed the pinned version — resolve it by hand: there is
+   exactly one line to carry forward, the `x-manticore-image:` anchor near
+   the top of the file. An empty `git status --short` before you start means
+   there's nothing dirty and none of this applies.
+
+2. Apply:
+
+   ```bash
+   docker compose up -d                          # Scenario A
+   docker compose --profile public up -d         # Scenario B
+   ```
+
+   Scenario B **must** include `--profile public`. Without it, Compose only
+   sees `manticore` in this command — the existing Caddy container is left
+   running, untouched, and outside this command's control, so it will not
+   pick up anything a pulled commit changed for it. If you're unsure which
+   scenario this host is set up as, `./config show` reports it under
+   `MANTICORE_SCENARIO`.
+
+   This does not disturb authentication, for the same reason recreating the
+   container to change the engine version doesn't — see "Upgrade Manticore"
+   below.
+
+3. Re-run setup only if a new `.env` key appeared. `./config setup` is
+   **not** required after a routine update — it exists to bootstrap
+   credentials, and a `git pull` on its own doesn't touch any. But a release
+   can add a new `.env` key that an existing install's `.env` doesn't have
+   yet. `./config show` reports such a key as `(not recorded)`; re-running
+   `./config setup` records your answer for it without rotating any existing
+   credential. `MANTICORE_SCENARIO`, added in v2.1.0, is exactly this case —
+   see [Configuration helper reference](#configuration-helper-reference) for
+   what a `setup` re-run does and does not touch.
+
+4. See what changed. This repository has no CHANGELOG file. What changed
+   between two commits is `git log --oneline`, and each release is recorded
+   as an annotated tag:
+
+   ```bash
+   git log --oneline v2.1.0..v2.2.0     # commits between two releases
+   git tag -n99                          # every release tag with its full message
+   ```
+
+**One update on this list is not just pull-and-apply.** If you're updating a
+deployment from before v2.1.0, see [Renaming the data volume to match the
+pinned project name](#renaming-the-data-volume-to-match-the-pinned-project-name)
+first — everything above assumes that has already been done, or was never
+needed because the deployment is newer.
+
 **Upgrade Manticore** to a new minor or patch version:
 
-1. Update the `image:` line in `docker-compose.yml` (e.g. `27.1.5` →
-   `27.1.6`).
+1. Update the version pinned by the `x-manticore-image` anchor near the top
+   of `docker-compose.yml`:
+
+   ```yaml
+   x-manticore-image: &manticore_image manticoresearch/manticore:27.1.5
+   ```
+
+   Both Manticore services — `manticore` and the `config` helper — read
+   `image: *manticore_image`, so this one line is the only place the version
+   is written; neither service has its own `image:` line to edit. Caddy's
+   tag is separate and lives on its own `image:` line under the `caddy`
+   service further down the file — it is not affected by this anchor.
 2. Pull the new image and recreate the container:
 
    ```bash
@@ -1412,6 +1500,67 @@ for the full list of subcommands.
 Recreating the container does not disturb authentication: users, grants and
 tokens live in `auth.json` inside the `manticore-data` volume, and survive
 `up -d --force-recreate` untouched.
+
+**Crossing a major version is a different exercise than a minor or patch
+bump.** The steps above are mechanical — edit the anchor, pull, recreate —
+and say nothing about whether that is *safe* for a given jump. A major
+release can change the plugin ABI, the cluster replication protocol, or
+on-disk table formats, and whether any of that applies to your upgrade is
+specific to the versions involved. Before crossing a major, read the release
+notes for every major version between what you run and what you're moving
+to, at the [Manticore Search blog](https://manticoresearch.com/blog/) and
+the [manual's Changelog](https://manual.manticoresearch.com/Changelog). The
+upstream notes, not this README, are the authority on whether a given jump
+needs more than pull-and-recreate — this section intentionally does not
+enumerate what any current release requires, since that goes stale the
+moment the next one ships.
+
+**Back up your data.** Manticore's data lives in the `manticore-data`
+Docker named volume. To get its location on the host:
+
+```bash
+docker volume inspect manticore-docker_manticore-data --format '{{ .Mountpoint }}'
+```
+
+For a consistent application-level snapshot (preferred for production),
+use Manticore's built-in backup tool:
+
+```bash
+docker exec manticore manticore-backup --backup-dir=/var/lib/manticore/backups
+```
+
+The backup is written to `/var/lib/manticore/backups` inside the
+container, which is also inside the `manticore-data` volume.
+See [Manticore's backup docs](https://manual.manticoresearch.com/Securing_and_compacting_a_table/Backup_and_restore)
+for details and the restore procedure.
+
+For a raw volume-level snapshot (faster, useful for whole-host backups),
+archive the entire volume into a tarball via a one-shot helper container:
+
+```bash
+docker run --rm \
+    -v manticore-docker_manticore-data:/data:ro \
+    -v "$(pwd)":/backup \
+    alpine \
+    tar czf /backup/manticore-data-$(date +%F).tar.gz -C /data .
+```
+
+This produces `manticore-data-YYYY-MM-DD.tar.gz` in the current
+directory. Copy it off the VPS for durability.
+
+To restore from a tarball (stop the stack first so nothing writes
+during the restore):
+
+```bash
+# Scenario B: add --profile public to both compose commands below.
+docker compose down
+docker run --rm \
+    -v manticore-docker_manticore-data:/data \
+    -v "$(pwd)":/backup \
+    alpine \
+    sh -c "rm -rf /data/* && tar xzf /backup/manticore-data-YYYY-MM-DD.tar.gz -C /data"
+docker compose up -d
+```
 
 ### Renaming the data volume to match the pinned project name
 
@@ -1548,52 +1697,6 @@ every other line alone, `.env.example` being copied only when `.env` does not ex
 so a hand-added `COMPOSE_PROJECT_NAME`, and its comment, come through a re-run untouched.
 See [the `setup` reference](#configuration-helper-reference) for what the wizard does and
 does not rewrite.
-
-**Back up your data.** Manticore's data lives in the `manticore-data`
-Docker named volume. To get its location on the host:
-
-```bash
-docker volume inspect manticore-docker_manticore-data --format '{{ .Mountpoint }}'
-```
-
-For a consistent application-level snapshot (preferred for production),
-use Manticore's built-in backup tool:
-
-```bash
-docker exec manticore manticore-backup --backup-dir=/var/lib/manticore/backups
-```
-
-The backup is written to `/var/lib/manticore/backups` inside the
-container, which is also inside the `manticore-data` volume.
-See [Manticore's backup docs](https://manual.manticoresearch.com/Securing_and_compacting_a_table/Backup_and_restore)
-for details and the restore procedure.
-
-For a raw volume-level snapshot (faster, useful for whole-host backups),
-archive the entire volume into a tarball via a one-shot helper container:
-
-```bash
-docker run --rm \
-    -v manticore-docker_manticore-data:/data:ro \
-    -v "$(pwd)":/backup \
-    alpine \
-    tar czf /backup/manticore-data-$(date +%F).tar.gz -C /data .
-```
-
-This produces `manticore-data-YYYY-MM-DD.tar.gz` in the current
-directory. Copy it off the VPS for durability.
-
-To restore from a tarball (stop the stack first so nothing writes
-during the restore):
-
-```bash
-docker compose --profile public down
-docker run --rm \
-    -v manticore-docker_manticore-data:/data \
-    -v "$(pwd)":/backup \
-    alpine \
-    sh -c "rm -rf /data/* && tar xzf /backup/manticore-data-YYYY-MM-DD.tar.gz -C /data"
-docker compose --profile public up -d
-```
 
 
 ## Embedding models for vector search
