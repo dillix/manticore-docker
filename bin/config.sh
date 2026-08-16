@@ -3,7 +3,7 @@
 # Manticore Search Docker Stack — configuration helper
 # =============================================================================
 # This script runs inside the `config` service container, which uses the same
-# pinned image as the daemon (manticoresearch/manticore:27.1.5). That image
+# pinned image as the daemon (manticoresearch/manticore:29.0.2). That image
 # ships GNU wget, sed, awk and base64 — but no curl and no jq — so everything
 # here speaks to the engine over HTTP with wget and parses JSON with sed.
 #
@@ -12,7 +12,7 @@
 #     username, admin token);
 #   - the engine's own users, passwords, bearer tokens and grants.
 #
-# Manticore 27.1.5 authenticates natively on both the HTTP and MySQL
+# Manticore 29.0.2 authenticates natively on both the HTTP and MySQL
 # protocols. The reverse proxy authenticates nothing.
 #
 # Invocation (always through the host-side wrapper, never directly):
@@ -966,12 +966,32 @@ cmd_show() {
 # unauthenticated 401 as "alive", because it has to be green before any admin
 # exists — so it proves the daemon is listening, not that it can execute
 # anything. This closes that gap.
+#
+# It also reports a table count via SHOW TABLES. That is a courtesy, not a
+# health signal on its own: this container has SQL and nothing else — no
+# access to the daemon's log or the data volume — so it cannot detect a table
+# that failed to load (logged as "NOT SERVING") any other way, and it must
+# NOT fail or change this subcommand's exit code just because the count is
+# zero, since zero is the correct, expected reading on a fresh install.
 cmd_check() {
+    local body table_count
     mc_auth_admin || return 1
     info "Running an authenticated query against ${MC_HOST}:${MC_PORT}..."
     if mc_sql 'SELECT 1' >/dev/null; then
         ok "The engine accepted the admin token and executed a query."
         echo ""
+        if body=$(mc_sql 'SHOW TABLES' 2>/dev/null); then
+            table_count=$(printf '%s' "$body" | mc_rows | grep -c '^' || true)
+            echo "Tables: $table_count"
+            if [ "$table_count" -eq 0 ]; then
+                echo "Zero is expected on a fresh install with nothing created yet."
+                echo "On an existing deployment it can instead mean the tables exist"
+                echo "but the engine isn't serving them — check with:"
+                echo "  docker compose logs manticore | grep -i 'NOT SERVING'"
+                echo "(see \"Upgrade Manticore\" in the README)."
+            fi
+            echo ""
+        fi
         echo "Note: this checks the admin credential from $ENV_FILE. The"
         echo "application user's password is not stored, so it cannot be"
         echo "checked here — './config password change' verifies a new one"

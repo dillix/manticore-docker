@@ -9,7 +9,7 @@ server for use with the
 [Search API Manticore](https://www.drupal.org/project/search_api_manticore)
 Drupal module, but it is generic — any HTTP client can talk to it.
 
-- **Manticore Search 27.1.5** — authentication is enforced by the engine
+- **Manticore Search 29.0.2** — authentication is enforced by the engine
   itself, on both the HTTP and MySQL protocols, with users, passwords, bearer
   tokens and per-action grants
 - **Caddy 2.11.4** — automatic Let's Encrypt TLS certificates. It terminates
@@ -348,7 +348,7 @@ Now choose your scenario:
 docker compose up -d
 ```
 
-On the first run Docker downloads the `manticoresearch/manticore:27.1.5`
+On the first run Docker downloads the `manticoresearch/manticore:29.0.2`
 image from Docker Hub (~200 MB) and creates the container in detached
 (background) mode. Expected output:
 
@@ -367,7 +367,7 @@ docker compose ps
 
 ```
 NAME        IMAGE                              STATUS                  PORTS
-manticore   manticoresearch/manticore:27.1.5   Up X seconds (healthy)  127.0.0.1:9306->9306/tcp, 127.0.0.1:9308->9308/tcp, 9312/tcp
+manticore   manticoresearch/manticore:29.0.2   Up X seconds (healthy)  127.0.0.1:9306->9306/tcp, 127.0.0.1:9308->9308/tcp, 9312/tcp
 ```
 
 Note that ports `9306` and `9308` are bound to `127.0.0.1` only — they are
@@ -991,12 +991,12 @@ curl -s -u "$MC_AUTH" http://127.0.0.1:9308/cli -d 'SHOW VERSION'
 +------------+-----------------------------------+
 | Component  | Version                           |
 +------------+-----------------------------------+
-| Daemon     | 27.1.5 5a1cf9399@26061911         |
-| Columnar   | columnar 13.6.1 94c1040@26061507  |
-| Secondary  | secondary 13.6.1 94c1040@26061507 |
-| Knn        | knn 13.6.1 94c1040@26061507       |
-| Embeddings | embeddings 1.1.1 94c1040@26061507 |
-| Buddy      | buddy v4.0.1+26061913-64a3819f    |
+| Daemon     | 29.0.2 2f9c226b6@26081409         |
+| Columnar   | columnar 13.9.0 dbc40aa@26080509  |
+| Secondary  | secondary 13.9.0 dbc40aa@26080509 |
+| Knn        | knn 13.9.0 dbc40aa@26080509       |
+| Embeddings | embeddings 1.1.1 dbc40aa@26080509 |
+| Buddy      | buddy v4.4.1+26081318-a3f8fe36    |
 +------------+-----------------------------------+
 ```
 
@@ -1126,7 +1126,7 @@ curl -s -u 'drupal:your-password' https://search.example.com/cli -d 'SHOW STATUS
 +-------------------------------+------------------------------------------------------------+
 | uptime                        | 86                                                         |
 | connections                   | 9                                                          |
-| version                       | 27.1.5 5a1cf9399@26061911 (columnar 13.6.1 ...)            |
+| version                       | 29.0.2 2f9c226b6@26081409 (columnar 13.9.0 ...)            |
 ...
 ```
 
@@ -1167,7 +1167,7 @@ before expiry.
 
 ## Authentication and the permission model
 
-Manticore 27.1.5 authenticates natively, on both the HTTP and MySQL
+Manticore 29.0.2 authenticates natively, on both the HTTP and MySQL
 protocols. A reverse proxy in front of it — the bundled Caddy, or your own
 nginx — terminates TLS and forwards the `Authorization` header; it holds no
 credentials and checks none.
@@ -1479,7 +1479,7 @@ needed because the deployment is newer.
    of `docker-compose.yml`:
 
    ```yaml
-   x-manticore-image: &manticore_image manticoresearch/manticore:27.1.5
+   x-manticore-image: &manticore_image manticoresearch/manticore:29.0.2
    ```
 
    Both Manticore services — `manticore` and the `config` helper — read
@@ -1488,6 +1488,10 @@ needed because the deployment is newer.
    tag is separate and lives on its own `image:` line under the `caddy`
    service further down the file — it is not affected by this anchor.
 2. Pull the new image and recreate the container:
+
+   **If the new version is a new major, stop here first** and read the
+   major-version warning further down in this section — once you run the
+   commands below, the pinned tag is no longer a way back.
 
    ```bash
    docker compose pull
@@ -1500,20 +1504,6 @@ needed because the deployment is newer.
 Recreating the container does not disturb authentication: users, grants and
 tokens live in `auth.json` inside the `manticore-data` volume, and survive
 `up -d --force-recreate` untouched.
-
-**Crossing a major version is a different exercise than a minor or patch
-bump.** The steps above are mechanical — edit the anchor, pull, recreate —
-and say nothing about whether that is *safe* for a given jump. A major
-release can change the plugin ABI, the cluster replication protocol, or
-on-disk table formats, and whether any of that applies to your upgrade is
-specific to the versions involved. Before crossing a major, read the release
-notes for every major version between what you run and what you're moving
-to, at the [Manticore Search blog](https://manticoresearch.com/blog/) and
-the [manual's Changelog](https://manual.manticoresearch.com/Changelog). The
-upstream notes, not this README, are the authority on whether a given jump
-needs more than pull-and-recreate — this section intentionally does not
-enumerate what any current release requires, since that goes stale the
-moment the next one ships.
 
 **Back up your data.** Manticore's data lives in the `manticore-data`
 Docker named volume. To get its location on the host:
@@ -1561,6 +1551,54 @@ docker run --rm \
     sh -c "rm -rf /data/* && tar xzf /backup/manticore-data-YYYY-MM-DD.tar.gz -C /data"
 docker compose up -d
 ```
+
+**Crossing a major version is a different exercise than a minor or patch
+bump, and the difference is not optional to read about.** The steps above
+are mechanical — edit the anchor, pull, recreate — and say nothing about
+whether that is *safe* for a given jump. Before crossing a major, read the
+release notes for every major version between what you run and what you're
+moving to, at the [Manticore Search blog](https://manticoresearch.com/blog/)
+and the [manual's Changelog](https://manual.manticoresearch.com/Changelog).
+That is necessary, but on its own it is not enough: upstream's compatibility
+notes tell you whether your data and configuration keep working *going
+forward* into the new version, and they can be entirely correct about that
+while still leaving you with no way back. A major release is free to rewrite
+a table's on-disk metadata the first time the new engine opens it, and an
+older binary then refuses to serve a table written in that newer format —
+even though nothing on disk is actually damaged. This is not hypothetical:
+it is what happens on the 27.1.5 → 29.0.2 jump this stack ships today.
+29.0.2 rewrites every table's `.meta` file from format v.22 to v.23 on first
+open. Point the pinned tag back at 27.1.5 afterwards and the daemon logs,
+for every table, `prealloc: ... .meta is v.23, binary is v.22 - NOT
+SERVING`, and serves none of them — while the container still reports
+`healthy`, `docker compose up -d --wait` still succeeds, and `./config
+check` still passes, because none of those three checks ever queries a
+table. Nothing is destroyed — the tables are disabled, not deleted, and
+moving forward to 29.0.2 again brings them all back — but **"flip the tag
+back" is not a rollback for a major upgrade**, on this jump or in general.
+**Snapshot the `manticore-data` volume before crossing a major** with one of
+the two procedures above; a real restore from that snapshot is the only way
+back once the new engine has touched your tables.
+
+**After a major upgrade, verify that the engine is serving, not just that
+it's healthy.** `healthy` and a successful `up -d --wait` both mean the
+daemon answered a query — neither means it has a single table loaded.
+Check, in order of how much they actually prove:
+
+- `SHOW TABLES` (over `docker exec -it manticore mysql -u drupal -p`, or
+  `/cli`) returns the tables you expect, not an empty set;
+- `docker compose logs manticore | grep -i 'NOT SERVING'` prints nothing;
+- a real query from the application — Drupal, or whatever else talks to
+  this stack — returns real results. `./config check` proves only that the
+  admin credential still authenticates and the engine still executes SQL;
+  it never touches a table, so it stays green through exactly the failure
+  above.
+
+**Expect a brief outage while the container recreates**, on any engine
+version bump: roughly 7 to 9 seconds of connection-refused (not 401 —
+nothing is listening) was measured on the 27.1.5 → 29.0.2 recreate of a
+small volume, and it grows with table count and data size. Treat that as an
+order of magnitude to plan around, not a promise for every deployment.
 
 ### Renaming the data volume to match the pinned project name
 
@@ -2098,10 +2136,19 @@ is something it must decline to answer rather than report as empty. See
 ```
 
 Runs an authenticated `SELECT 1` against the engine using
-`MANTICORE_ADMIN_TOKEN`. It verifies the **admin** credential only; the
-application user's password is not stored anywhere, so it cannot be checked
-after the fact — `./config password change` verifies a new one at the moment
-it is issued.
+`MANTICORE_ADMIN_TOKEN`, then reports the table count from `SHOW TABLES`. It
+verifies the **admin** credential only; the application user's password is
+not stored anywhere, so it cannot be checked after the fact — `./config
+password change` verifies a new one at the moment it is issued.
+
+The table count is a courtesy, not a health check of its own — the helper
+container has SQL and nothing else, no access to the daemon's log or the
+data volume, so it cannot tell "no tables were ever created" from "tables
+exist but the engine isn't serving them" and does not try to; zero tables is
+expected and not an error on a fresh install, so it never changes `check`'s
+exit code. On an existing deployment, a zero you were not expecting is worth
+chasing down with `docker compose logs manticore | grep -i 'NOT SERVING'` —
+see "Upgrade Manticore" for when this happens.
 
 **Set domain, email, or username:**
 

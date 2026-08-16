@@ -28,7 +28,7 @@ name: manticore-docker
 #
 # Compose ignores top-level keys prefixed with `x-`, so this defines nothing
 # but the anchor.
-x-manticore-image: &manticore_image manticoresearch/manticore:27.1.5
+x-manticore-image: &manticore_image manticoresearch/manticore:29.0.2
 
 services:
 
